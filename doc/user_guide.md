@@ -358,7 +358,7 @@ This tab lets you run two types of factorial interaction analysis on the fly.  S
 
 **RMST** — fits an OLS regression on jackknife pseudo-values of restricted mean survival time.  Coefficients are in hours (difference in mean survival time).  This method does **not** assume proportional hazards and is appropriate when the PH assumption is violated.
 
-Each time you click Cox or RMST, the new analysis is appended to the results panel and the report file is immediately rewritten to include all analyses run so far.  You can run multiple analyses with different factor selections and all results accumulate.
+Each time you click Cox or RMST, the new analysis is appended to the log and written under `<stem>_results/statistics/`.  Files include the factors in the model, active level filters, coefficients, and (for Cox) PH and LR interaction tests.  If `report.md` already exists, its interaction section is updated in place.  You can run multiple analyses with different factor selections and all results accumulate.
 
 ### Exporting Reports
 
@@ -398,6 +398,15 @@ Results are written to `<input_stem>_results/` next to the input file, or to the
     number_at_risk.png   — Number at risk
     defined_plot_01.png  — First defined plot (DLife only, if present)
     defined_plot_02.png  — Second defined plot (if present)
+    ...
+  statistics/
+    logrank_pairwise.csv — Pairwise log-rank (from full pipeline)
+    interaction_analyses.md — Cox/RMST runs from the Hub (accumulated)
+    cox_ph_01_metadata.txt  — Factors, level filters, formula (per run)
+    cox_ph_01_coefficients.csv
+    cox_ph_01_ph_test.csv   — Schoenfeld residuals (Cox only)
+    cox_ph_01_lr_interaction.json
+    rmst_02_metadata.txt    — RMST runs use the same naming pattern
     ...
   data_output/
     lifetables.csv       — Full actuarial lifetable

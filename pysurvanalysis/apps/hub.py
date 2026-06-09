@@ -109,6 +109,7 @@ class HubWindow(QMainWindow):
         self._factor_levels: dict[str, list[str]] = {}
         self._factor_allowed: dict[str, set[str]] = {}
         self._artifact_tabs: dict[str, QWidget] = {}
+        self._interaction_analyses: list[dict] = []
 
         self._build_ui()
 
@@ -620,6 +621,7 @@ class HubWindow(QMainWindow):
             self._data = data
             self._factors = factors
             self._loaded_path = path
+            self._interaction_analyses = []
             self._lifetables = lifetable.compute_lifetables(data)
             self._refresh_factor_checks()
             self._dataset_summary.setText(
@@ -963,6 +965,7 @@ class HubWindow(QMainWindow):
                 print(ph.to_string(index=False))
             for w in res.get("warnings", []) or []:
                 print(f"  warning: {w}")
+            self._persist_interaction_analysis(res, selected)
             return None
         self._spawn_task("Cox PH", _do)
 
@@ -988,6 +991,7 @@ class HubWindow(QMainWindow):
             for k in ("r_squared", "f_statistic", "f_p_value", "AIC", "log_likelihood"):
                 if res.get(k) is not None:
                     print(f"  {k}: {res[k]}")
+            self._persist_interaction_analysis(res, selected)
             return None
         self._spawn_task("RMST regression", _do)
 
@@ -1015,6 +1019,30 @@ class HubWindow(QMainWindow):
     def _results_dir_for(self, input_path: Path) -> Path:
         """Project-relative output dir for a given data file (``<stem>_results/``)."""
         return self._project_dir / f"{input_path.stem}_results"
+
+    def _interaction_metadata(self, selected: list[str]) -> dict:
+        """Capture factor selection and level filters for saved analyses."""
+        return {
+            "factors_selected": list(selected),
+            "factor_level_filters": {
+                f: sorted(self._factor_allowed.get(f, set()))
+                for f in self._factors
+            },
+            "input_file": self._loaded_path.name if self._loaded_path else None,
+        }
+
+    def _persist_interaction_analysis(self, res: dict, selected: list[str]) -> None:
+        """Append a Cox/RMST result and write outputs under the results folder."""
+        if self._loaded_path is None or self._project_dir is None:
+            print("  (results not saved — no project/data file loaded)")
+            return
+        enriched = {**res, **self._interaction_metadata(selected)}
+        self._interaction_analyses.append(enriched)
+        out_dir = self._results_dir_for(self._loaded_path)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        saved = report.save_interaction_analyses(out_dir, self._interaction_analyses)
+        for path in saved:
+            print(f"Saved: {path}")
 
     def _action_full_pipeline(self) -> None:
         path = self._resolve_input_path()
