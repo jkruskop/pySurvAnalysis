@@ -187,13 +187,20 @@ def mean_survival(individual_data: pd.DataFrame) -> pd.DataFrame:
 
     results = []
     for treatment, grp in lt.groupby("treatment"):
-        grp = grp[grp["time"] <= t_max].copy()
+        grp = grp[grp["time"] <= t_max].sort_values("time")
         times = grp["time"].values
         surv = grp["km_lx"].values
 
-        # Trapezoidal integration of survival curve
-        if len(times) > 1:
-            area = np.trapezoid(surv, times)
+        # Trapezoidal integration of the survival curve. Prepend the origin
+        # (t=0, S=1) so the initial [0, first_event] interval (area ≈
+        # first_event × 1.0) is included — omitting it biases RMST low, and
+        # because the first event time differs by arm the bias is unequal across
+        # treatments (distorting RMST *differences*, not just levels). This
+        # matches _km_mean_median_one_group, which already anchors the origin.
+        if len(times) >= 1:
+            times_full = np.concatenate([[0.0], times])
+            surv_full = np.concatenate([[1.0], surv])
+            area = np.trapezoid(surv_full, times_full)
         else:
             area = np.nan
 
