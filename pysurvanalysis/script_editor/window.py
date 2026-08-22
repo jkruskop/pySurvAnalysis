@@ -1,4 +1,17 @@
-"""Visual Script Editor window: palette / canvas / inspector / preview."""
+"""Visual Script Editor: palette / canvas / inspector / preview, level-aware.
+
+One canvas and one YAML splicer serve three script sets:
+
+* **Experiment scripts** — an Experiment Directory's ``survival_config.yaml``
+  ``scripts:``, whose palette is ``core ∪ type`` for that experiment's type;
+* **Project scripts** — ``project.yaml`` ``scripts:``, over the separate
+  project-action registry; and
+* **Central experiment scripts** — ``project.yaml`` ``experiment_scripts:``,
+  one recipe serving every member.
+
+The levels cannot mix: switching the level switches the registry, and a step
+naming an action outside the active registry is a hard error (ADR-0002).
+"""
 
 from __future__ import annotations
 
@@ -25,17 +38,28 @@ from PyQt6.QtWidgets import (
 
 import yaml
 
-from .. import scripts_io
+from ..domain import config as cfgmod
+from ..domain import is_experiment_dir, is_project_dir
 from ..ui import ActionButton, Category, TopBar, icon, resolved_mode
 from ..ui import settings as ui_settings
-from .actions import ACTIONS
+from . import project_actions
+from .actions import POOL, registry_for, validate_steps
 from .canvas import Canvas
 from .inspector import Inspector
 from .palette import Palette
 
 
+#: level key → (label, target file, yaml section)
+LEVELS = {
+    "experiment": ("Experiment scripts", cfgmod.CONFIG_FILENAME, "scripts"),
+    "project": ("Project scripts", cfgmod.PROJECT_FILENAME, "scripts"),
+    "central": ("Central experiment scripts", cfgmod.PROJECT_FILENAME,
+                "experiment_scripts"),
+}
+
+
 class ScriptEditorWindow(QMainWindow):
-    """Edit a project's saved scripts and write to ``survival_scripts.yaml``."""
+    """Edit the saved scripts of an Experiment Directory or a Project."""
 
     scriptsSaved = pyqtSignal(str)  # absolute YAML path
 
@@ -49,14 +73,70 @@ class ScriptEditorWindow(QMainWindow):
         self.setWindowTitle("pySurvAnalysis — Script Editor")
         self.resize(1280, 780)
 
-        self._project_dir = Path(project_dir)
-        self._scripts: list[dict] = scripts_io.load_scripts(self._project_dir)
-        self._active_idx = 0 if self._scripts else -1
+        self._directory = Path(project_dir)
+        self._project_dir = self._directory  # kept: callers pass either level
         self._factors = list(factors or [])
         self._dirty = False
+        self._experiment = None
+        self._project = None
+        self._resolve_context()
+
+        self._level = ("experiment" if self._experiment is not None else "project")
+        self._scripts: list[dict] = self._read_scripts(self._level)
+        self._active_idx = 0 if self._scripts else -1
 
         self._build_ui()
         self._load_active_script()
+
+    # ------------------------------------------------------------- context
+
+    def _resolve_context(self) -> None:
+        """Work out which of an Experiment Directory / Project we are editing."""
+        from ..domain import Project, SurvivalExperiment
+
+        d = self._directory
+        if is_project_dir(d):
+            self._project = Project(d)
+        elif is_experiment_dir(d):
+            parent = Project(d.parent) if is_project_dir(d.parent) else None
+            self._project = parent
+            self._experiment = SurvivalExperiment(
+                d, defaults=parent.defaults if parent else {}, project=parent)
+            if not self._factors:
+                self._factors = list(
+                    (self._experiment.config.get("factors") or {}))
+
+    def _available_levels(self) -> list[str]:
+        levels = []
+        if self._experiment is not None:
+            levels.append("experiment")
+        if self._project is not None:
+            levels.extend(["project", "central"])
+        return levels or ["experiment"]
+
+    def _registry(self) -> dict:
+        if self._level == "project":
+            return project_actions.PROJECT_ACTIONS
+        exp_type = self._experiment.type if self._experiment is not None else None
+        if self._level == "central" and exp_type is None and self._project is not None:
+            exp_type = self._project.type
+        return registry_for(exp_type)
+
+    def _target_path(self, level: str | None = None) -> Path:
+        level = level or self._level
+        _label, filename, _section = LEVELS[level]
+        if level == "experiment" and self._experiment is not None:
+            base = self._experiment.directory
+        elif self._project is not None:
+            base = self._project.directory
+        else:
+            base = self._directory
+        return base / filename
+
+    def _read_scripts(self, level: str) -> list[dict]:
+        _label, _filename, section = LEVELS[level]
+        data = cfgmod.read_yaml(self._target_path(level))
+        return [deepcopy(s) for s in cfgmod.scripts_of(data, section)]
 
     # --------------------------------------------------------------- UI
 
@@ -79,9 +159,17 @@ class ScriptEditorWindow(QMainWindow):
         self._top_bar.add_right(save_btn)
         outer.addWidget(self._top_bar)
 
-        # Scripts dropdown + name editor
+        # Level switcher + scripts dropdown + name editor
         ctrl_row = QHBoxLayout()
         ctrl_row.setContentsMargins(12, 8, 12, 8)
+        ctrl_row.addWidget(QLabel("Level:"))
+        self._level_combo = QComboBox()
+        for key in self._available_levels():
+            self._level_combo.addItem(LEVELS[key][0], key)
+        self._level_combo.setCurrentText(LEVELS[self._level][0])
+        self._level_combo.currentIndexChanged.connect(self._on_level_changed)
+        ctrl_row.addWidget(self._level_combo)
+        ctrl_row.addSpacing(16)
         ctrl_row.addWidget(QLabel("Active script:"))
         self._scripts_combo = QComboBox()
         self._scripts_combo.setMinimumWidth(240)
@@ -90,7 +178,12 @@ class ScriptEditorWindow(QMainWindow):
         rename = ActionButton("Rename…", Category.TOOLS, icon_name="config")
         rename.clicked.connect(self._rename_active)
         ctrl_row.addWidget(rename)
+        check = ActionButton("Validate", Category.TOOLS, icon_name="validate")
+        check.clicked.connect(self._validate_active)
+        ctrl_row.addWidget(check)
         ctrl_row.addStretch(1)
+        self._context_lbl = QLabel("")
+        ctrl_row.addWidget(self._context_lbl)
         outer.addLayout(ctrl_row)
 
         # Three-pane horizontal splitter, with preview underneath
@@ -100,7 +193,7 @@ class ScriptEditorWindow(QMainWindow):
         h_splitter = QSplitter(Qt.Orientation.Horizontal)
         h_splitter.setChildrenCollapsible(False)
 
-        self._palette = Palette(ACTIONS)
+        self._palette = Palette(self._registry())
         self._palette.actionRequested.connect(self._on_action_added)
         h_splitter.addWidget(self._palette)
 
@@ -134,6 +227,7 @@ class ScriptEditorWindow(QMainWindow):
 
         outer.addWidget(v_splitter, 1)
         self._refresh_scripts_combo()
+        self._refresh_context_label()
 
     # -------------------------------------------------------- script ops
 
@@ -204,7 +298,7 @@ class ScriptEditorWindow(QMainWindow):
         if self._active_idx < 0:
             QMessageBox.information(self, "No script", "Create a script first (+ New script).")
             return
-        action = ACTIONS.get(action_key)
+        action = self._registry().get(action_key)
         if action is None:
             return
         # Build a step with default param values
@@ -223,7 +317,7 @@ class ScriptEditorWindow(QMainWindow):
         self._update_preview()
 
     def _on_step_selected(self, idx: int, step: dict) -> None:
-        action = ACTIONS.get(step.get("action", "")) if step else None
+        action = self._registry().get(step.get("action", "")) if step else None
         self._inspector.show_step(idx, action, step or {})
 
     def _on_step_edited(self, idx: int, step: dict) -> None:
@@ -237,8 +331,57 @@ class ScriptEditorWindow(QMainWindow):
             self._dirty = True
             self._update_preview()
 
+    def _on_level_changed(self, _idx: int) -> None:
+        if self._dirty and not self._confirm_discard():
+            self._level_combo.blockSignals(True)
+            self._level_combo.setCurrentText(LEVELS[self._level][0])
+            self._level_combo.blockSignals(False)
+            return
+        self._level = self._level_combo.currentData()
+        self._scripts = self._read_scripts(self._level)
+        self._active_idx = 0 if self._scripts else -1
+        self._dirty = False
+        self._palette.set_actions(self._registry())
+        self._refresh_scripts_combo()
+        self._refresh_context_label()
+        self._load_active_script()
+
+    def _confirm_discard(self) -> bool:
+        return QMessageBox.question(
+            self, "Unsaved changes",
+            "Switching level discards unsaved edits. Continue?"
+        ) == QMessageBox.StandardButton.Yes
+
+    def _refresh_context_label(self) -> None:
+        target = self._target_path()
+        if self._level == "project":
+            detail = "project action registry"
+        else:
+            exp_type = (self._experiment.type if self._experiment is not None
+                        else (self._project.type if self._project else None))
+            detail = f"core ∪ {getattr(exp_type, 'label', 'Custom Experiment')}"
+        self._context_lbl.setText(f"{target.name} · {detail}")
+
+    def _validate_active(self) -> None:
+        steps = self._canvas.steps()
+        if self._level == "project":
+            problems = project_actions.validate_project_steps(steps)
+        else:
+            exp_type = (self._experiment.type if self._experiment is not None
+                        else (self._project.type if self._project else None))
+            problems = validate_steps(steps, exp_type)
+        if problems:
+            QMessageBox.warning(
+                self, "Script will not run",
+                "A step names an action this level does not provide, so the "
+                "script would refuse to start:\n\n  - " + "\n  - ".join(problems))
+        else:
+            QMessageBox.information(self, "Validate",
+                                    "Every step resolves — this script will run.")
+
     def _update_preview(self) -> None:
-        scripts_view = {"scripts": self._scripts}
+        _label, _filename, section = LEVELS[self._level]
+        scripts_view = {section: self._scripts}
         try:
             text = yaml.safe_dump(scripts_view, sort_keys=False, indent=2, default_flow_style=False)
         except Exception as err:  # noqa: BLE001
@@ -248,7 +391,14 @@ class ScriptEditorWindow(QMainWindow):
     # ------------------------------------------------------------- IO
 
     def _save(self) -> None:
-        path = scripts_io.save_scripts(self._project_dir, deepcopy(self._scripts))
+        """Splice this level's section into its file, other keys untouched."""
+        _label, _filename, section = LEVELS[self._level]
+        path = self._target_path()
+        data = cfgmod.read_yaml(path)
+        data[section] = deepcopy(self._scripts)
+        cfgmod.write_yaml(path, data)
         self._dirty = False
         self.scriptsSaved.emit(str(path))
-        QMessageBox.information(self, "Saved", f"Wrote {len(self._scripts)} script(s) to {path}.")
+        QMessageBox.information(
+            self, "Saved",
+            f"Wrote {len(self._scripts)} script(s) to {path} under `{section}:`.")

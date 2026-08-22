@@ -651,3 +651,184 @@ def plot_chamber_overlay_km(
     fig.tight_layout()
     return fig
 
+
+
+# ---------------------------------------------------------------------------
+# Interaction Experiment figures
+#
+# Both are new with the 2x2 Experiment Type: the faceted KM is its Headline
+# Figure, and the lifespan interaction plot states in one panel the thing the
+# Cox interaction term is testing.
+# ---------------------------------------------------------------------------
+
+def _factor_levels(data: pd.DataFrame, factors: dict[str, list]) -> tuple[str, list,
+                                                                         str, list]:
+    """Resolve the two factor names and their declared level order.
+
+    Levels come from the config's declared order (first = Reference Level) so
+    panel order, colour assignment and legend order never depend on how the
+    levels happen to sort.
+    """
+    names = list(factors)
+    if len(names) != 2:
+        raise ValueError(
+            "An interaction figure needs exactly two declared factors; got "
+            f"{len(names)} ({', '.join(names) or 'none'})."
+        )
+    f1, f2 = names
+    l1 = [lv for lv in factors[f1]] or sorted(map(str, data[f1].dropna().unique()))
+    l2 = [lv for lv in factors[f2]] or sorted(map(str, data[f2].dropna().unique()))
+    return f1, l1, f2, l2
+
+
+def plot_km_faceted(
+    lifetable: pd.DataFrame,
+    factors: dict[str, list],
+    title: str = "Survival by treatment, faceted by genotype",
+    show_ci: bool = False,
+    time_label: str = "Age",
+) -> plt.Figure:
+    """One panel per level of factor 1; curves coloured by factor 2.
+
+    The Interaction Experiment's Headline Figure: a treatment effect that
+    differs between panels *is* the interaction, visible without reading a
+    coefficient.
+    """
+    lt = lifetable.copy()
+    lt["treatment"] = lt["treatment"].astype(str)
+    parts = lt["treatment"].str.split("/", n=1, expand=True)
+    if parts.shape[1] < 2:
+        raise ValueError(
+            "Faceted KM needs two-factor treatment labels of the form "
+            "'<level1>/<level2>'."
+        )
+    lt["_f1"], lt["_f2"] = parts[0], parts[1]
+    names = list(factors)
+    if len(names) != 2:
+        raise ValueError(
+            "A faceted KM needs exactly two declared factors; got "
+            f"{len(names)} ({', '.join(names) or 'none'})."
+        )
+    f1, f2 = names
+    l1 = list(factors[f1]) or sorted(set(lt["_f1"]))
+    l2 = list(factors[f2]) or sorted(set(lt["_f2"]))
+
+    present1 = [lv for lv in l1 if lv in set(lt["_f1"])]
+    if not present1:
+        present1 = sorted(set(lt["_f1"]))
+    colors = {lv: COLORS[i % len(COLORS)] for i, lv in enumerate(l2)}
+
+    fig, axes = plt.subplots(
+        1, len(present1), figsize=(5.5 * len(present1), 5), sharey=True, squeeze=False,
+    )
+    for ax, level1 in zip(axes[0], present1):
+        panel = lt[lt["_f1"] == level1]
+        for level2 in l2:
+            grp = panel[panel["_f2"] == level2]
+            if grp.empty:
+                continue
+            times = np.concatenate([[0], grp["time"].values])
+            surv = np.concatenate([[1.0], grp["km_lx"].values])
+            color = colors.get(level2, "#666666")
+            ax.step(times, surv, where="post", label=str(level2),
+                    color=color, linewidth=1.8)
+            if show_ci:
+                ci_lo = np.concatenate([[1.0], grp["km_ci_lo"].values])
+                ci_hi = np.concatenate([[1.0], grp["km_ci_hi"].values])
+                ax.fill_between(times, ci_lo, ci_hi, step="post",
+                                alpha=0.15, color=color)
+            cens = grp[grp["n_censored"] > 0]
+            if not cens.empty:
+                ax.plot(cens["time"].values, cens["km_lx"].values, "|",
+                        color=color, markersize=8, markeredgewidth=1.5)
+        ax.set_title(f"{f1}: {level1}", fontsize=12)
+        ax.set_xlabel(time_label, fontsize=11)
+        ax.set_ylim(-0.02, 1.05)
+        ax.set_xlim(left=0)
+        ax.grid(True, alpha=0.3)
+
+    axes[0][0].set_ylabel("Survival probability", fontsize=12)
+    axes[0][-1].legend(title=f2, loc="best", fontsize=10)
+    fig.suptitle(title, fontsize=14)
+    fig.tight_layout()
+    return fig
+
+
+def plot_lifespan_interaction(
+    individual_data: pd.DataFrame,
+    factors: dict[str, list],
+    metric: str = "median",
+    title: str = "Lifespan interaction",
+    time_label: str = "Age",
+) -> plt.Figure:
+    """Cell lifespan by factor level: non-parallel lines indicate interaction.
+
+    ``metric`` is ``"median"`` (Kaplan-Meier median, the default) or ``"mean"``.
+    Error bars are bootstrap-free normal-approximation intervals on the cell
+    statistic, which is what the eye needs here — the formal test is the Cox
+    interaction term, not this figure.
+    """
+    f1, l1, f2, l2 = _factor_levels(individual_data, factors)
+    metric = metric.lower()
+    if metric not in {"median", "mean"}:
+        raise ValueError("metric must be 'median' or 'mean'.")
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    colors = {lv: COLORS[i % len(COLORS)] for i, lv in enumerate(l1)}
+    x_positions = {lv: i for i, lv in enumerate(l2)}
+
+    for level1 in l1:
+        xs, ys, errs = [], [], []
+        for level2 in l2:
+            cell = individual_data[
+                (individual_data[f1].astype(str) == str(level1))
+                & (individual_data[f2].astype(str) == str(level2))
+            ]
+            if cell.empty:
+                continue
+            value, err = _cell_statistic(cell, metric)
+            if value is None:
+                continue
+            xs.append(x_positions[level2])
+            ys.append(value)
+            errs.append(err)
+        if not xs:
+            continue
+        ax.errorbar(xs, ys, yerr=errs, marker="o", markersize=8, capsize=4,
+                    linewidth=2, color=colors.get(level1, "#666666"),
+                    label=str(level1))
+
+    ax.set_xticks(list(x_positions.values()))
+    ax.set_xticklabels([str(lv) for lv in l2])
+    ax.set_xlim(-0.35, len(l2) - 0.65)
+    ax.set_xlabel(f2, fontsize=12)
+    ax.set_ylabel(f"{metric.capitalize()} lifespan — {time_label}", fontsize=12)
+    ax.set_title(title, fontsize=14)
+    ax.legend(title=f1, loc="best", fontsize=10)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    return fig
+
+
+def _cell_statistic(cell: pd.DataFrame, metric: str) -> tuple[float | None, float]:
+    """One cell's lifespan statistic and a rough interval half-width."""
+    from lifelines import KaplanMeierFitter
+
+    times, events = cell["time"].values, cell["event"].values
+    if len(times) == 0:
+        return None, 0.0
+    if metric == "mean":
+        value = float(np.mean(times))
+        err = float(np.std(times, ddof=1) / np.sqrt(len(times))) if len(times) > 1 else 0.0
+        return value, 1.96 * err
+
+    kmf = KaplanMeierFitter()
+    try:
+        kmf.fit(times, event_observed=events)
+        value = float(kmf.median_survival_time_)
+    except Exception:  # noqa: BLE001 - a degenerate cell falls back to the raw median
+        value = float(np.median(times))
+    if not np.isfinite(value):
+        value = float(np.median(times))
+    err = float(np.std(times, ddof=1) / np.sqrt(len(times))) if len(times) > 1 else 0.0
+    return value, 1.96 * err

@@ -1,1269 +1,999 @@
-"""Analysis Hub — main entry point for pySurvAnalysis.
+"""The Analysis Hub — pySurvAnalysis's main window.
 
-Loads survival data, exposes every analysis and plot in the library as
-category-coloured buttons, routes figures and stdout to a tabbed
-:class:`PlotDock`, and launches the Config Editor and QC Viewer in their
-own subprocesses.
+A horizontal tile strip (Batch · Project · Analyze · QC · Plots · Scripts · AI ·
+Tools) over a full-width output area. Each tile shows only live status; all of
+its controls live in an anchored panel, one open at a time.
 
-Modelled on PyTrackingAnalysis's ``apps/hub.py`` and pyflic's
-``base/analysis_hub.py``; see :doc:`the plan file </doc>` for the
-card-by-card layout.
+Two things differ from the sister app by design:
+
+* the **selection** may be a Batch, a Project, *or* a standalone Experiment
+  Directory — a Project is not required to load anything (ADR-0003); and
+* the **Analyze** panel's buttons are contributed by the loaded experiment's
+  Experiment Type, so a button and its script action are one declaration
+  (ADR-0002).
 """
 
 from __future__ import annotations
 
-import os
-import re
-import subprocess
 import sys
 from pathlib import Path
 
-import matplotlib
-
-matplotlib.use("Agg")  # noqa: E402
-
-from PyQt6.QtCore import QSize, Qt
+from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
-    QButtonGroup,
-    QCheckBox,
     QComboBox,
-    QDoubleSpinBox,
     QFileDialog,
-    QFormLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
-    QProgressBar,
     QPushButton,
-    QRadioButton,
-    QScrollArea,
-    QSplitter,
-    QToolButton,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from .. import (
-    data_loader,
-    exclusions,
-    lifetable,
-    plotting,
-    report,
-    scripts_io,
-    statistics,
+from ..domain import (
+    Batch,
+    Project,
+    ProjectError,
+    SurvivalExperiment,
+    config as cfgmod,
+    is_experiment_dir,
+    is_project_dir,
+    upgrade as upgrade_mod,
 )
-from ..pipeline import run_analysis
+from ..experiment_types import available_types
 from ..ui import (
     ActionButton,
     Card,
     Category,
     OutputLog,
     PlotDock,
-    SidebarNav,
     TopBar,
-    ZoomableImageView,
-    ZoomableMarkdownView,
-    ZoomableTextView,
     apply_theme,
+    current_mode,
     icon,
-    resolved_mode,
 )
 from ..ui import settings as ui_settings
+from ._hub_tiles import ClickAwayFilter, StatusPanel, StatusTile, TilePanel
 from .common import TaskWorker
 
-_SAVED_RE = re.compile(r"^\s*Saved:\s+(\S.*?)\s*$")
+PANEL_WIDTH = 540
 
-
-def _wrap_layout(layout) -> QWidget:
-    host = QWidget()
-    host.setLayout(layout)
-    return host
+#: key, title, icon, category — the strip, left to right.
+TILES = (
+    ("batch", "Batch", "batch", Category.NEUTRAL),
+    ("project", "Project", "project", Category.NEUTRAL),
+    ("analyze", "Analyze", "analyze", Category.ANALYZE),
+    ("qc", "QC", "qc", Category.QC),
+    ("plots", "Plots", "plots", Category.PLOTS),
+    ("scripts", "Scripts", "scripts", Category.SCRIPTS),
+    ("ai", "AI", "ai", Category.AI),
+    ("tools", "Tools", "tools", Category.TOOLS),
+)
 
 
 class HubWindow(QMainWindow):
-    """The Analysis Hub main window."""
+    """The Hub. One selection, at most one loaded experiment, one open panel."""
 
-    def __init__(self, initial_project: str | None = None) -> None:
+    def __init__(self, initial_path: str | None = None) -> None:
         super().__init__()
         self.setWindowTitle("pySurvAnalysis — Analysis Hub")
-        self.resize(1350, 860)
-        self.setAcceptDrops(True)
+        self.resize(1360, 900)
 
-        self._project_dir: Path | None = None
-        self._loaded_path: Path | None = None  # absolute path of last-loaded data file
-        self._data = None  # individual-level DataFrame
-        self._factors: list[str] = []
-        self._lifetables = None  # cached
-        self._scripts: list[dict] = []
+        self._selection: Path | None = None
+        self._batch: Batch | None = None
+        self._project: Project | None = None
+        self._experiment: SurvivalExperiment | None = None
         self._worker: TaskWorker | None = None
-        self._cards: dict[str, Card] = {}
-        self._factor_checks: dict[str, QCheckBox] = {}
-        self._factor_filter_btns: dict[str, QToolButton] = {}
-        self._factor_levels: dict[str, list[str]] = {}
-        self._factor_allowed: dict[str, set[str]] = {}
-        self._artifact_tabs: dict[str, QWidget] = {}
-        self._interaction_analyses: list[dict] = []
+        self._tiles: dict[str, StatusTile] = {}
+        self._panels: dict[str, TilePanel] = {}
+        self._open_panel: str | None = None
 
         self._build_ui()
+        self._click_away = ClickAwayFilter(self)
+        QApplication.instance().installEventFilter(self._click_away)
 
-        if initial_project:
-            self._set_project_dir(initial_project)
+        if initial_path:
+            self._set_selection(initial_path)
+        else:
+            recent = ui_settings.get("recent_projects", []) or []
+            if recent:
+                self._set_selection(recent[0])
+        self._refresh_all()
 
-    # ------------------------------------------------------------------ UI
+    # ── construction ───────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
         outer = QVBoxLayout(central)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
+        outer.setContentsMargins(10, 8, 10, 10)
+        outer.setSpacing(8)
 
-        self._top_bar = TopBar("pySurvAnalysis — Analysis Hub")
-        self._interactive_checkbox = QCheckBox("Interactive plots")
-        self._interactive_checkbox.setChecked(bool(ui_settings.get("interactive_plots", False)))
-        self._interactive_checkbox.toggled.connect(
-            lambda v: ui_settings.set_value("interactive_plots", bool(v))
-        )
-        self._interactive_checkbox.setToolTip(
-            "When checked, plot tabs use a live matplotlib canvas with zoom/pan "
-            "toolbar and hover tooltips. Off (default): plots render as static "
-            "PNGs (faster)."
-        )
-        self._top_bar.add_right(self._interactive_checkbox)
-        self._btn_theme = QToolButton()
-        self._btn_theme.setIcon(
-            icon("theme_dark" if resolved_mode() == "light" else "theme_light")
-        )
-        self._btn_theme.setIconSize(QSize(18, 18))
-        self._btn_theme.setAutoRaise(True)
-        self._btn_theme.setToolTip("Toggle light / dark theme")
-        self._btn_theme.clicked.connect(self._toggle_theme)
-        self._top_bar.add_right(self._btn_theme)
-        outer.addWidget(self._top_bar)
-
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setChildrenCollapsible(False)
-
-        left_host = QWidget()
-        left_lay = QHBoxLayout(left_host)
-        left_lay.setContentsMargins(0, 0, 0, 0)
-        left_lay.setSpacing(0)
-
-        self._sidebar = SidebarNav()
-        self._sidebar.add_item("project", "Project", "project", category=Category.NEUTRAL)
-        self._sidebar.add_item("load", "Load", "load", category=Category.LOAD)
-        self._sidebar.add_item("analyze", "Analyze", "logrank", category=Category.ANALYZE)
-        self._sidebar.add_item("plots", "Plots", "plots", category=Category.PLOTS)
-        self._sidebar.add_item("scripts", "Scripts", "scripts", category=Category.SCRIPTS)
-        self._sidebar.add_item("tools", "Tools", "tools", category=Category.TOOLS)
-        self._sidebar.add_stretch()
-        self._sidebar.itemSelected.connect(self._scroll_to_card)
-        left_lay.addWidget(self._sidebar)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(scroll.Shape.NoFrame)
-        cards_host = QWidget()
-        self._cards_lay = QVBoxLayout(cards_host)
-        self._cards_lay.setContentsMargins(12, 12, 12, 12)
-        self._cards_lay.setSpacing(12)
-
-        self._build_project_card()
-        self._build_load_card()
-        self._build_analyze_card()
-        self._build_plots_card()
-        self._build_scripts_card()
-        self._build_tools_card()
-        self._cards_lay.addStretch(1)
-
-        scroll.setWidget(cards_host)
-        self._cards_scroll = scroll
-        left_lay.addWidget(scroll, 1)
-        left_host.setMinimumWidth(620)
-        splitter.addWidget(left_host)
-
-        self._log = OutputLog()
-        self._plot_dock = PlotDock(self._log)
-        self._plot_dock.setMinimumWidth(440)
-        splitter.addWidget(self._plot_dock)
-
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([640, 740])
-        outer.addWidget(splitter, 1)
-
-        self._progress = QProgressBar()
-        self._progress.setRange(0, 0)
-        self._progress.setVisible(False)
-        self._progress.setFixedHeight(4)
-        outer.addWidget(self._progress)
-
-        self._log.append_line(
-            "Welcome to pySurvAnalysis. Pick a project directory under "
-            "Project → Browse, then click 'Load data' on the Load card."
-        )
-
-    # -------- card: Project --------
-
-    def _build_project_card(self) -> None:
-        card = Card(
-            "Project",
-            category=Category.LOAD,
-            subtitle="Pick the experiment folder and the active exclusion group.",
-            icon_name="project",
-        )
-        form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
-        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
-
-        self._project_edit = QLineEdit()
-        self._project_edit.setPlaceholderText("/path/to/experiment/folder")
-        self._project_edit.setReadOnly(True)
-        browse = ActionButton("Browse…", Category.NEUTRAL, icon_name="browse")
-        browse.clicked.connect(self._pick_project_dir)
-        recent_btn = ActionButton("Recent…", Category.NEUTRAL, icon_name="menu")
+        self._topbar = TopBar("pySurvAnalysis")
+        open_btn = QPushButton(icon("open"), " Open…")
+        open_btn.clicked.connect(self._pick_directory)
+        recent_btn = QPushButton(icon("menu"), " Recent")
         recent_btn.clicked.connect(self._show_recent_menu)
-        proj_col = QVBoxLayout()
-        proj_col.setContentsMargins(0, 0, 0, 0)
-        proj_col.setSpacing(6)
-        proj_col.addWidget(self._project_edit)
-        btn_row = QHBoxLayout()
-        btn_row.addWidget(browse)
-        btn_row.addWidget(recent_btn)
-        btn_row.addStretch(1)
-        proj_col.addLayout(btn_row)
-        form.addRow("Project dir:", _wrap_layout(proj_col))
+        theme_btn = QPushButton(icon("theme_dark"), "")
+        theme_btn.setToolTip("Toggle light/dark theme")
+        theme_btn.clicked.connect(self._toggle_theme)
+        for btn in (open_btn, recent_btn, theme_btn):
+            self._topbar.add_right(btn)
+        outer.addWidget(self._topbar)
 
+        strip = QWidget()
+        strip_lay = QHBoxLayout(strip)
+        strip_lay.setContentsMargins(0, 0, 0, 0)
+        strip_lay.setSpacing(1)
+        for i, (key, title, icon_name, category) in enumerate(TILES):
+            tile = StatusTile(key, title, icon_name, category)
+            tile.set_rounding(8 if i == 0 else 0, 0)
+            tile.clicked.connect(self._toggle_panel)
+            self._tiles[key] = tile
+            strip_lay.addWidget(tile)
+        self._status_panel = StatusPanel()
+        strip_lay.addWidget(self._status_panel, 1)
+        outer.addWidget(strip)
+
+        # The log is the dock's first tab; figures open beside it.
+        self._log = OutputLog()
+        self._plots = PlotDock(self._log)
+        outer.addWidget(self._plots, 1)
+
+        self._central = central
+        for key, *_ in TILES:
+            panel = TilePanel(key, PANEL_WIDTH, central)
+            self._panels[key] = panel
+        self._build_panels()
+
+    def _build_panels(self) -> None:
+        self._build_batch_panel()
+        self._build_project_panel()
+        self._build_analyze_panel()
+        self._build_qc_panel()
+        self._build_plots_panel()
+        self._build_scripts_panel()
+        self._build_ai_panel()
+        self._build_tools_panel()
+        for panel in self._panels.values():
+            panel.finish()
+
+    # ── panels ─────────────────────────────────────────────────────────────
+
+    def _build_batch_panel(self) -> None:
+        card = Card("Batch run", Category.NEUTRAL, icon_name="batch",
+                    subtitle="Run one Project Script in every Project below "
+                             "this directory, continue-on-error.")
+        self._batch_table = self._make_table(["Project", "Type", "Members", "Report"])
+        card.add_body(self._batch_table)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Script:"))
+        self._batch_script = QComboBox()
+        row.addWidget(self._batch_script, 1)
+        card.add_body(row)
+
+        run = ActionButton("Run batch", Category.NEUTRAL, icon_name="play")
+        run.clicked.connect(self._action_run_batch)
+        card.add_body(run)
+        self._panels["batch"].add_card(card)
+
+    def _build_project_panel(self) -> None:
+        card = Card("Project", Category.NEUTRAL, icon_name="project",
+                    subtitle="Double-click a member to load it.")
+        self._members_table = self._make_table(
+            ["Member", "Type", "N", "Analysed", "Exclusions"])
+        self._members_table.doubleClicked.connect(self._on_member_double_clicked)
+        card.add_body(self._members_table)
+
+        row = QHBoxLayout()
+        add = QPushButton(icon("add"), " Add member…")
+        add.clicked.connect(self._action_add_member)
+        create = QPushButton(icon("new"), " Create project…")
+        create.clicked.connect(self._action_create_project)
+        row.addWidget(add)
+        row.addWidget(create)
+        card.add_body(row)
+        self._panels["project"].add_card(card)
+
+        run_card = Card("Project actions", Category.ANALYZE, icon_name="report")
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Script:"))
+        self._project_script = QComboBox()
+        row.addWidget(self._project_script, 1)
+        run_card.add_body(row)
+        run_btn = ActionButton("Run project script", Category.ANALYZE, icon_name="play")
+        run_btn.clicked.connect(self._action_run_project_script)
+        run_card.add_body(run_btn)
+        report_btn = ActionButton("Project report", Category.ANALYZE, icon_name="report")
+        report_btn.clicked.connect(self._action_project_report)
+        run_card.add_body(report_btn)
+        validate_btn = ActionButton("Validate project", Category.TOOLS,
+                                    icon_name="validate")
+        validate_btn.clicked.connect(self._action_validate_project)
+        run_card.add_body(validate_btn)
+        self._panels["project"].add_card(run_card)
+
+    def _build_analyze_panel(self) -> None:
+        self._analyze_card = Card(
+            "Analyze", Category.ANALYZE, icon_name="analyze",
+            subtitle="Buttons here are contributed by the loaded experiment's "
+                     "Experiment Type.")
+        self._panels["analyze"].add_card(self._analyze_card)
+
+    def _build_qc_panel(self) -> None:
+        card = Card("Quality control", Category.QC, icon_name="qc",
+                    subtitle="Exclusion groups are configuration: the active "
+                             "group is written to survival_config.yaml and "
+                             "stamped on every output.")
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Active group:"))
         self._group_combo = QComboBox()
         self._group_combo.setEditable(True)
-        self._group_combo.setToolTip(
-            "Active exclusion group from remove_chambers.csv. The chambers in "
-            "this group are excluded from every analysis."
-        )
-        form.addRow("Exclusion group:", self._group_combo)
-
-        card.add_body(form)
-
-        launchers = QHBoxLayout()
-        qc_view = ActionButton("QC viewer…", Category.QC, icon_name="qc")
-        qc_view.clicked.connect(lambda: self._launch_subapp("qc"))
-        launchers.addWidget(qc_view)
-        launchers.addStretch(1)
-        card.add_body(launchers)
-
-        self._cards["project"] = card
-        self._cards_lay.addWidget(card)
-
-    # -------- card: Load --------
-
-    def _build_load_card(self) -> None:
-        card = Card(
-            "Load",
-            category=Category.LOAD,
-            subtitle=(
-                "DLife workbook (.xlsx) or comma-delimited (.csv). "
-                "Experimental design is read directly from the data file."
-            ),
-            icon_name="load",
-        )
-        self._fmt_excel = QRadioButton("DLife (.xlsx)")
-        self._fmt_csv = QRadioButton("Comma-delimited (.csv)")
-        self._fmt_excel.setChecked(True)
-        grp = QButtonGroup(self)
-        grp.addButton(self._fmt_excel)
-        grp.addButton(self._fmt_csv)
-        fmt_row = QHBoxLayout()
-        fmt_row.addWidget(self._fmt_excel)
-        fmt_row.addWidget(self._fmt_csv)
-        fmt_row.addStretch(1)
-        card.add_body(fmt_row)
-
-        # Used only when the CSV is auto-detected as wide format (two factors,
-        # one column per group×event). Long-format CSVs ignore this field.
-        wide_row = QHBoxLayout()
-        wide_row.addWidget(QLabel("Wide factor names:"))
-        self._wide_factor_names = QLineEdit()
-        self._wide_factor_names.setPlaceholderText("e.g. Sex, Diet (only for wide CSV)")
-        self._wide_factor_names.setToolTip(
-            "Only needed when a CSV is auto-detected as wide format. Leave "
-            "blank for long CSV or DLife .xlsx files."
-        )
-        wide_row.addWidget(self._wide_factor_names, 1)
-        card.add_body(wide_row)
-
-        load_btn = ActionButton(
-            "Load data", Category.LOAD, icon_name="load", primary=True
-        )
-        load_btn.clicked.connect(self._load_data)
-        reload_btn = ActionButton("Reload", Category.TOOLS, icon_name="refresh")
-        reload_btn.clicked.connect(self._load_data)
-        row = QHBoxLayout()
-        row.addWidget(load_btn)
-        row.addWidget(reload_btn)
+        row.addWidget(self._group_combo, 1)
         card.add_body(row)
 
-        self._dataset_summary = QLabel("(no data loaded)")
-        self._dataset_summary.setStyleSheet("color: palette(mid); font-style: italic;")
-        self._dataset_summary.setWordWrap(True)
-        card.add_body(self._dataset_summary)
+        apply_btn = ActionButton("Set active group", Category.QC, icon_name="check")
+        apply_btn.clicked.connect(self._action_set_exclusion_group)
+        card.add_body(apply_btn)
 
-        self._cards["load"] = card
-        self._cards_lay.addWidget(card)
+        viewer = ActionButton("Chamber QC viewer…", Category.QC, icon_name="chamber")
+        viewer.clicked.connect(self._action_open_qc_viewer)
+        card.add_body(viewer)
+        self._panels["qc"].add_card(card)
 
-    # -------- card: Analyze --------
+    def _build_plots_panel(self) -> None:
+        card = Card("Publication figures", Category.PLOTS, icon_name="figures",
+                    subtitle="Vector figures from plot_specs.yaml — styles come "
+                             "from the Project, specs from the experiment.")
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Format:"))
+        self._fig_format = QComboBox()
+        self._fig_format.addItems(["svg", "pdf", "png"])
+        row.addWidget(self._fig_format, 1)
+        card.add_body(row)
 
-    def _build_analyze_card(self) -> None:
-        card = Card(
-            "Analyze",
-            category=Category.ANALYZE,
-            subtitle="Pick factors, then run the test or model.",
-            icon_name="logrank",
-        )
-        card.add_section_label("FACTORS")
-        self._factors_host = QWidget()
-        self._factors_lay = QVBoxLayout(self._factors_host)
-        self._factors_lay.setContentsMargins(0, 0, 0, 0)
-        self._factors_lay.setSpacing(2)
-        self._factors_placeholder = QLabel("Load data to see factors.")
-        self._factors_placeholder.setStyleSheet("color: palette(mid); font-style: italic;")
-        self._factors_lay.addWidget(self._factors_placeholder)
-        card.add_body(self._factors_host)
+        render = ActionButton("Render figures", Category.PLOTS, icon_name="figures")
+        render.clicked.connect(self._action_render_figures)
+        card.add_body(render)
+        editor = ActionButton("Plot editor…", Category.PLOTS, icon_name="plot")
+        editor.clicked.connect(self._action_open_plot_editor)
+        card.add_body(editor)
+        self._panels["plots"].add_card(card)
 
-        tau_row = QHBoxLayout()
-        tau_row.addWidget(QLabel("RMST τ (hours, 0 = auto):"))
-        self._tau_spin = QDoubleSpinBox()
-        self._tau_spin.setRange(0.0, 1e6)
-        self._tau_spin.setDecimals(1)
-        self._tau_spin.setSingleStep(24)
-        self._tau_spin.setValue(0.0)
-        tau_row.addWidget(self._tau_spin)
-        tau_row.addStretch(1)
-        card.add_body(tau_row)
+    def _build_scripts_panel(self) -> None:
+        card = Card("Experiment scripts", Category.SCRIPTS, icon_name="scripts",
+                    subtitle="The loaded experiment's own scripts, plus the "
+                             "Project's central set.")
+        self._scripts_combo = QComboBox()
+        card.add_body(self._scripts_combo)
+        run = ActionButton("Run script", Category.SCRIPTS, icon_name="play")
+        run.clicked.connect(self._action_run_experiment_script)
+        card.add_body(run)
+        edit = ActionButton("Edit scripts…", Category.SCRIPTS, icon_name="config")
+        edit.clicked.connect(self._action_open_script_editor)
+        card.add_body(edit)
+        self._panels["scripts"].add_card(card)
 
-        card.add_section_label("STATISTICS")
-        for label, fn in (
-            ("Log-rank pairwise", self._action_logrank_pairwise),
-            ("Log-rank omnibus", self._action_logrank_omnibus),
-            ("Gehan-Wilcoxon pairwise", self._action_gehan_wilcoxon),
-            ("Hazard ratios (pairwise)", self._action_hazard_ratios),
-            ("Cox PH (interactions)", self._action_cox_ph),
-            ("RMST regression", self._action_rmst),
-            ("Parametric AFT models", self._action_parametric),
-        ):
-            btn = ActionButton(label, Category.ANALYZE, icon_name="logrank")
-            btn.clicked.connect(fn)
-            card.add_body(btn)
-
-        card.add_section_label("PIPELINE")
-        full_btn = ActionButton(
-            "Run full pipeline (writes report.md)",
-            Category.ANALYZE,
-            icon_name="report",
-            primary=True,
-        )
-        full_btn.clicked.connect(self._action_full_pipeline)
-        card.add_body(full_btn)
-
-        self._cards["analyze"] = card
-        self._cards_lay.addWidget(card)
-
-    # -------- card: Plots --------
-
-    def _build_plots_card(self) -> None:
-        card = Card(
-            "Plots",
-            category=Category.PLOTS,
-            subtitle="Figures appear as tabs on the right.",
-            icon_name="plots",
-        )
-        for label, fn, ic in (
-            ("KM curves", self._action_plot_km, "km"),
-            ("KM + risk table", self._action_plot_km_risk, "risk"),
-            ("Nelson-Aalen", self._action_plot_nelson_aalen, "hazard"),
-            ("Hazard rate", self._action_plot_hazard, "hazard"),
-            ("Smoothed hazard", self._action_plot_smoothed_hazard, "hazard"),
-            ("Mortality (qx)", self._action_plot_mortality, "plot"),
-            ("Number at risk", self._action_plot_number_at_risk, "plot"),
-            ("Cumulative events", self._action_plot_cumulative, "plot"),
-            ("Hazard ratio forest", self._action_plot_forest, "forest"),
-            ("Survival distribution", self._action_plot_distribution, "plot"),
-            ("Log-log diagnostic", self._action_plot_log_log, "plot"),
-        ):
-            btn = ActionButton(label, Category.PLOTS, icon_name=ic)
-            btn.clicked.connect(fn)
-            card.add_body(btn)
-        self._cards["plots"] = card
-        self._cards_lay.addWidget(card)
-
-    # -------- card: Scripts --------
-
-    def _build_scripts_card(self) -> None:
-        card = Card(
-            "Scripts",
-            category=Category.SCRIPTS,
-            subtitle="Saved analysis pipelines (survival_scripts.yaml).",
-            icon_name="scripts",
-        )
-        self._scripts_list = QListWidget()
-        self._scripts_list.setMinimumHeight(80)
-        self._scripts_list.itemDoubleClicked.connect(
-            lambda _item: self._run_selected_script()
-        )
-        card.add_body(self._scripts_list)
+    def _build_ai_panel(self) -> None:
+        card = Card("AI narrative", Category.AI, icon_name="ai",
+                    subtitle="A paragraph per member plus a labelled "
+                             "across-members paragraph. Summarizes the saved "
+                             "numbers; never computes its own.")
+        self._ai_status = QLabel("")
+        self._ai_status.setWordWrap(True)
+        card.add_body(self._ai_status)
 
         row = QHBoxLayout()
-        run_btn = ActionButton("Run selected", Category.SCRIPTS, icon_name="play", primary=True)
-        run_btn.clicked.connect(self._run_selected_script)
-        edit_btn = ActionButton("Open Script Editor…", Category.SCRIPTS, icon_name="scripts")
-        edit_btn.clicked.connect(self._open_script_editor)
-        row.addWidget(run_btn)
-        row.addWidget(edit_btn)
+        row.addWidget(QLabel("Provider:"))
+        self._ai_provider = QComboBox()
+        row.addWidget(self._ai_provider, 1)
         card.add_body(row)
-        self._cards["scripts"] = card
-        self._cards_lay.addWidget(card)
 
-    # -------- card: Tools --------
+        run = ActionButton("Write narrative", Category.AI, icon_name="ai")
+        run.clicked.connect(self._action_ai_narrative)
+        card.add_body(run)
+        with_report = ActionButton("Project report with narrative",
+                                   Category.AI, icon_name="report")
+        with_report.clicked.connect(
+            lambda: self._action_project_report(with_narrative=True))
+        card.add_body(with_report)
+        self._panels["ai"].add_card(card)
 
-    def _build_tools_card(self) -> None:
-        card = Card(
-            "Tools",
-            category=Category.TOOLS,
-            subtitle="Reports, exports, settings.",
-            icon_name="tools",
-        )
-        for label, fn, ic in (
-            ("Generate report.md", self._action_generate_report, "report"),
-            ("Open output directory", self._action_open_output_dir, "open"),
-            ("Clear plot tabs", self._action_clear_tabs, "clear"),
+    def _build_tools_panel(self) -> None:
+        card = Card("Tools", Category.TOOLS, icon_name="tools")
+        for label, icon_name, handler in (
+            ("Upgrade directory…", "upgrade", self._action_upgrade),
+            ("Wrap in a project…", "project", self._action_wrap_in_project),
+            ("Validate config", "validate", self._action_validate_config),
+            ("Open analysis folder", "open", self._action_open_analysis),
+            ("Clear log", "clear", self._log.clear),
         ):
-            btn = ActionButton(label, Category.TOOLS, icon_name=ic)
-            btn.clicked.connect(fn)
+            btn = ActionButton(label, Category.TOOLS, icon_name=icon_name)
+            btn.clicked.connect(handler)
             card.add_body(btn)
-        self._cards["tools"] = card
-        self._cards_lay.addWidget(card)
+        self._panels["tools"].add_card(card)
 
-    # ------------------------------------------------------------ helpers
+    @staticmethod
+    def _make_table(headers: list[str]) -> QTableWidget:
+        table = QTableWidget(0, len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.verticalHeader().setVisible(False)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for col in range(1, len(headers)):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        table.setMinimumHeight(150)
+        return table
 
-    def _scroll_to_card(self, key: str) -> None:
-        card = self._cards.get(key)
-        if card is None:
+    # ── panel open/close ───────────────────────────────────────────────────
+
+    def _toggle_panel(self, key: str) -> None:
+        if self._open_panel == key:
+            self.close_panel()
             return
-        self._cards_scroll.ensureWidgetVisible(card, 0, 16)
+        self.close_panel()
+        tile = self._tiles[key]
+        panel = self._panels[key]
+        top_left = tile.mapTo(self._central, tile.rect().bottomLeft())
+        panel.open_at(top_left.x(), top_left.y() + 4, self._central.height())
+        tile.set_active(True)
+        self._open_panel = key
 
-    def _toggle_theme(self) -> None:
-        new_mode = "light" if resolved_mode() == "dark" else "dark"
-        ui_settings.set_value("theme", new_mode)
-        QMessageBox.information(
-            self,
-            "Theme changed",
-            "Theme preference saved. Restart the Hub to apply the new theme.",
-        )
+    def close_panel(self) -> None:
+        if self._open_panel is None:
+            return
+        self._panels[self._open_panel].hide()
+        self._tiles[self._open_panel].set_active(False)
+        self._open_panel = None
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        if event.key() == Qt.Key.Key_Escape:
+            self.close_panel()
+        super().keyPressEvent(event)
+
+    # ── selection ──────────────────────────────────────────────────────────
+
+    def _pick_directory(self) -> None:
+        path = QFileDialog.getExistingDirectory(
+            self, "Open a Batch, Project or Experiment directory",
+            str(self._selection or Path.home()))
+        if path:
+            self._set_selection(path)
+            self._refresh_all()
 
     def _show_recent_menu(self) -> None:
-        recents = ui_settings.get("recent_projects", []) or []
         menu = QMenu(self)
-        if not recents:
-            act = QAction("(no recent projects)", self)
-            act.setEnabled(False)
+        recent = ui_settings.get("recent_projects", []) or []
+        if not recent:
+            menu.addAction("(nothing recent)").setEnabled(False)
+        for path in recent:
+            act = QAction(path, self)
+            act.triggered.connect(
+                lambda _checked, p=path: (self._set_selection(p), self._refresh_all()))
             menu.addAction(act)
-        else:
-            for path in recents:
-                act = QAction(path, self)
-                act.triggered.connect(lambda _checked, p=path: self._set_project_dir(p))
-                menu.addAction(act)
         menu.exec(self.cursor().pos())
 
-    def _pick_project_dir(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Pick project directory")
-        if path:
-            self._set_project_dir(path)
+    def _set_selection(self, path: str | Path) -> None:
+        """Classify a directory as Batch, Project, standalone Experiment, or bare.
 
-    def _set_project_dir(self, path: str | Path) -> None:
+        The selection names the working container; loading a Member Experiment
+        is a separate act (a double-click in the members table), so the two
+        contexts can never disagree about the current subject.
+        """
         p = Path(path).expanduser().resolve()
         if not p.is_dir():
-            QMessageBox.warning(self, "Not a directory", f"{p} is not a directory.")
+            self._warn(f"{p} is not a directory.")
             return
-        self._project_dir = p
-        self._project_edit.setText(str(p))
-        ui_settings.add_recent_project(p)
-        # Auto-detect input format from what's in the directory
-        if any(p.glob("*.xlsx")):
-            self._fmt_excel.setChecked(True)
-        elif any(p.glob("*.csv")) or any(p.glob("*.tsv")):
-            self._fmt_csv.setChecked(True)
-        self._refresh_group_combo()
-        self._refresh_scripts_list()
-        self._log.append_line(f"\nProject: {p}")
 
-    def _refresh_group_combo(self) -> None:
-        self._group_combo.blockSignals(True)
-        self._group_combo.clear()
-        if self._project_dir is not None:
-            groups = exclusions.list_groups(self._project_dir)
-            for g in groups:
-                self._group_combo.addItem(g)
-            if not groups:
-                self._group_combo.addItem("default")
-        self._group_combo.blockSignals(False)
+        self._selection = p
+        self._batch = None
+        self._project = None
+        self._experiment = None
 
-    def _refresh_scripts_list(self) -> None:
-        self._scripts_list.clear()
-        if self._project_dir is None:
-            self._scripts = []
-            return
-        self._scripts = scripts_io.load_scripts(self._project_dir)
-        for s in self._scripts:
-            name = str(s.get("name", "(unnamed)"))
-            n_steps = len(s.get("steps", []) or [])
-            QListWidgetItem(f"{name}  ({n_steps} steps)", self._scripts_list)
-
-    # ------------------------------------------------------------ load/run
-
-    def _selected_format(self) -> str:
-        if self._fmt_csv.isChecked():
-            return "csv"
-        return "excel"
-
-    def _resolve_input_path(self) -> Path | None:
-        if self._project_dir is None:
-            QMessageBox.warning(self, "No project", "Pick a project directory first.")
-            return None
-        fmt = self._selected_format()
-        if fmt == "excel":
-            candidates = sorted(self._project_dir.glob("*.xlsx"))
-            if not candidates:
-                QMessageBox.warning(self, "No .xlsx", "No .xlsx file found in the project dir.")
-                return None
-            if len(candidates) == 1:
-                return candidates[0]
-            picked, _ = QFileDialog.getOpenFileName(
-                self, "Select .xlsx file", str(self._project_dir),
-                "Excel files (*.xlsx)",
-            )
-            return Path(picked) if picked else None
-        # csv (long or wide — auto-detected by data_loader)
-        candidates = sorted(
-            list(self._project_dir.glob("*.csv")) + list(self._project_dir.glob("*.tsv"))
-        )
-        if not candidates:
-            QMessageBox.warning(self, "No CSV", "No .csv or .tsv file found in the project dir.")
-            return None
-        if len(candidates) == 1:
-            return candidates[0]
-        picked, _ = QFileDialog.getOpenFileName(
-            self, "Select CSV/TSV file", str(self._project_dir),
-            "CSV/TSV files (*.csv *.tsv)",
-        )
-        return Path(picked) if picked else None
-
-    def _excluded_set(self) -> set:
-        if self._project_dir is None:
-            return set()
-        group = self._group_combo.currentText().strip() or "default"
-        return exclusions.chambers_for_group(self._project_dir, group)
-
-    def _load_data(self) -> None:
-        path = self._resolve_input_path()
-        if path is None:
-            return
-        fmt = self._selected_format()
-        excluded = self._excluded_set()
-        is_excel = path.suffix.lower() == ".xlsx"
-        excel_excluded = (
-            data_loader.load_chamber_flags(path) if is_excel else set()
-        )
-        merged_excluded = excluded | excel_excluded
-
-        # Excel: read AssumeCensored from the PrivateData sheet.
-        # CSV: data is already individual-level so the flag is irrelevant; pass True.
-        assume_censored = (
-            data_loader.read_assume_censored(path) if is_excel else True
-        )
-
-        kwargs = dict(
-            assume_censored=assume_censored,
-            excluded_chambers=merged_excluded,
-        )
-        if fmt == "csv":
-            # data_loader auto-detects long vs wide; provide factor_names as a
-            # fallback in case the file is wide.
-            kwargs["csv_format"] = "auto"
-            wide_factors = [
-                p.strip() for p in self._wide_factor_names.text().split(",") if p.strip()
-            ]
-            if wide_factors:
-                kwargs["factor_names"] = wide_factors
-
-        excluded_msg = (
-            f"Excluded {len(merged_excluded)} chamber(s) "
-            f"(group '{self._group_combo.currentText().strip() or 'default'}'"
-            f"{', ChamberFlags sheet' if excel_excluded else ''})."
-        ) if merged_excluded else "No chambers excluded."
-
-        def _do_load():
-            print(f"Loading {path.name} ({fmt}) …")
-            print(excluded_msg)
-            data, factors = data_loader.load_experiment(path, **kwargs)
-            print(f"Loaded {len(data)} individuals, {data['treatment'].nunique()} treatments, "
-                  f"{len(factors)} factor(s): {factors}.")
-            return (data, factors)
-
-        def _on_ok(_msg: str, payload: tuple) -> None:
-            data, factors = payload
-            self._data = data
-            self._factors = factors
-            self._loaded_path = path
-            self._interaction_analyses = []
-            self._lifetables = lifetable.compute_lifetables(data)
-            self._refresh_factor_checks()
-            self._dataset_summary.setText(
-                f"<b>{len(data)}</b> individuals · "
-                f"<b>{data['treatment'].nunique()}</b> treatments · "
-                f"<b>{len(factors)}</b> factor(s) · "
-                f"<b>{int(data['event'].sum())}</b> events"
-            )
-
-        self._spawn_payload_task("Load data", _do_load, _on_ok)
-
-    def _refresh_factor_checks(self) -> None:
-        # Clear existing
-        while self._factors_lay.count():
-            item = self._factors_lay.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        self._factor_checks.clear()
-        self._factor_filter_btns.clear()
-        self._factor_levels.clear()
-        self._factor_allowed.clear()
-        if not self._factors or self._data is None:
-            placeholder = QLabel("Load data to see factors.")
-            placeholder.setStyleSheet("color: palette(mid); font-style: italic;")
-            self._factors_lay.addWidget(placeholder)
-            return
-        for f in self._factors:
-            levels = sorted({str(v) for v in self._data[f].dropna().unique()})
-            self._factor_levels[f] = levels
-            self._factor_allowed[f] = set(levels)
-
-            row = QHBoxLayout()
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(4)
-            cb = QCheckBox(f)
-            cb.setChecked(True)
-            row.addWidget(cb)
-
-            btn = QToolButton()
-            btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-            btn.setAutoRaise(True)
-            btn.setToolTip(f"Filter levels of '{f}' included in the analysis.")
-            btn.setMenu(self._build_levels_menu(f))
-            self._update_filter_btn_label(f, btn)
-            row.addWidget(btn)
-            row.addStretch(1)
-
-            host = QWidget()
-            host.setLayout(row)
-            self._factors_lay.addWidget(host)
-            self._factor_checks[f] = cb
-            self._factor_filter_btns[f] = btn
-
-    def _build_levels_menu(self, factor: str) -> QMenu:
-        menu = QMenu(self)
-        for lvl in self._factor_levels.get(factor, []):
-            act = QAction(str(lvl), self)
-            act.setCheckable(True)
-            act.setChecked(lvl in self._factor_allowed[factor])
-            act.toggled.connect(
-                lambda checked, f=factor, level=lvl: self._on_level_toggled(f, level, checked)
-            )
-            menu.addAction(act)
-        if self._factor_levels.get(factor):
-            menu.addSeparator()
-        all_act = menu.addAction("Select all")
-        all_act.triggered.connect(lambda _=False, f=factor: self._set_all_levels(f, True))
-        none_act = menu.addAction("Select none")
-        none_act.triggered.connect(lambda _=False, f=factor: self._set_all_levels(f, False))
-        return menu
-
-    def _on_level_toggled(self, factor: str, level: str, checked: bool) -> None:
-        allowed = self._factor_allowed.setdefault(factor, set())
-        if checked:
-            allowed.add(level)
-        else:
-            allowed.discard(level)
-        btn = self._factor_filter_btns.get(factor)
-        if btn is not None:
-            self._update_filter_btn_label(factor, btn)
-
-    def _set_all_levels(self, factor: str, checked: bool) -> None:
-        levels = self._factor_levels.get(factor, [])
-        self._factor_allowed[factor] = set(levels) if checked else set()
-        # Rebuild menu so the action checkmarks reflect the new state
-        btn = self._factor_filter_btns.get(factor)
-        if btn is not None:
-            old = btn.menu()
-            btn.setMenu(self._build_levels_menu(factor))
-            if old is not None:
-                old.deleteLater()
-            self._update_filter_btn_label(factor, btn)
-
-    def _update_filter_btn_label(self, factor: str, btn: QToolButton) -> None:
-        total = len(self._factor_levels.get(factor, []))
-        kept = len(self._factor_allowed.get(factor, set()))
-        if total == 0:
-            text = "(no levels)"
-        elif kept == total:
-            text = f"all ({total}) ▾"
-        else:
-            text = f"{kept}/{total} ▾"
-        btn.setText(text)
-
-    def _selected_factors(self) -> list[str]:
-        return [f for f, cb in self._factor_checks.items() if cb.isChecked()]
-
-    def _subset_data(self) -> tuple:
-        """Apply factor selection + per-factor level filters to ``self._data``.
-
-        Returns ``(data, factors)`` where ``factors`` are the selected factor
-        names and ``data`` has rows dropped for any disallowed level on a
-        selected factor, with ``treatment`` rebuilt from the selected factors.
-        Returns ``(None, [])`` if no data is loaded.
-        """
-        if self._data is None:
-            return None, []
-        selected = self._selected_factors()
-        if not selected:
-            selected = list(self._factors)
-        df = self._data.copy()
-        for f in selected:
-            allowed = self._factor_allowed.get(f)
-            if allowed is None:
-                continue
-            df = df[df[f].astype(str).isin(allowed)]
-        df = df.reset_index(drop=True)
-        if len(df) and selected:
-            df["treatment"] = df[selected].astype(str).agg("/".join, axis=1)
-        return df, selected
-
-    # ------------------------------------------------------------ workers
-
-    def _spawn_task(self, name: str, fn) -> None:
-        if self._worker is not None and self._worker.isRunning():
-            QMessageBox.information(self, "Busy", f"Another task is running: {self._worker.task_name}.")
-            return
-        self._progress.setVisible(True)
-        self._worker = TaskWorker(name, fn)
-        self._worker.log_text.connect(self._on_log_text)
-        self._worker.figure_ready.connect(self._on_figure_ready)
-        self._worker.finished_ok.connect(self._on_task_ok)
-        self._worker.failed.connect(self._on_task_failed)
-        self._worker.finished.connect(lambda: self._progress.setVisible(False))
-        self._worker.start()
-
-    def _spawn_payload_task(self, name: str, fn, on_ok) -> None:
-        """Variant that captures the function's return value for the slot."""
-        if self._worker is not None and self._worker.isRunning():
-            QMessageBox.information(self, "Busy", f"Another task is running: {self._worker.task_name}.")
-            return
-        self._progress.setVisible(True)
-        result_holder: dict = {}
-
-        def _wrapped():
-            payload = fn()
-            result_holder["payload"] = payload
-            return f"{name} complete."
-
-        worker = TaskWorker(name, _wrapped)
-        self._worker = worker
-        worker.log_text.connect(self._on_log_text)
-        worker.figure_ready.connect(self._on_figure_ready)
-
-        def _ok(msg: str) -> None:
+        if is_project_dir(p):
             try:
-                if "payload" in result_holder:
-                    on_ok(msg, result_holder["payload"])
-            finally:
-                self._on_task_ok(msg)
+                self._project = Project(p)
+            except ProjectError as exc:
+                self._warn(str(exc))
+        elif is_experiment_dir(p):
+            # A standalone Experiment Directory loads itself: with no pooling,
+            # a Project buys it nothing (ADR-0003).
+            parent_project = Project(p.parent) if is_project_dir(p.parent) else None
+            self._project = parent_project
+            defaults = parent_project.defaults if parent_project else {}
+            self._experiment = SurvivalExperiment(p, defaults=defaults,
+                                                  project=parent_project)
+            self._log.append_line(f"Loaded standalone experiment {p.name} "
+                             f"({self._experiment.type.label}).")
+        elif any(d.is_dir() and is_project_dir(d) for d in p.iterdir()):
+            self._batch = Batch(p)
 
-        worker.finished_ok.connect(_ok)
-        worker.failed.connect(self._on_task_failed)
-        worker.finished.connect(lambda: self._progress.setVisible(False))
+        ui_settings.add_recent_project(str(p))
+        self._log.append_line(f"Selection: {p}")
+
+    def _on_member_double_clicked(self, index) -> None:
+        if self._project is None:
+            return
+        row = index.row()
+        item = self._members_table.item(row, 0)
+        if item is None:
+            return
+        name = item.text()
+        try:
+            self._experiment = self._project.member(name)
+        except ProjectError as exc:
+            self._warn(str(exc))
+            return
+        self._log.append_line(f"Loaded {name} ({self._experiment.type.label}).")
+        self._refresh_all()
+
+    # ── refresh ────────────────────────────────────────────────────────────
+
+    def _refresh_all(self) -> None:
+        self._refresh_tables()
+        self._refresh_analyze_panel()
+        self._refresh_scripts()
+        self._refresh_exclusion_groups()
+        self._refresh_ai()
+        self._refresh_tiles()
+
+    def _refresh_tiles(self) -> None:
+        batch_projects = len(self._batch.project_dirs()) if self._batch else 0
+        self._tiles["batch"].set_dimmed(self._batch is None)
+        self._tiles["batch"].set_summary(
+            [f"{batch_projects} project(s)", self._batch.name] if self._batch
+            else ["no batch selected", "select a folder of projects"])
+
+        if self._project is not None:
+            members = self._project.members()
+            analysed = sum(1 for m in members if m.status().analyzed)
+            loaded = (f"loaded: {self._experiment.name}" if self._experiment
+                      else "double-click a member to load")
+            self._tiles["project"].set_summary(
+                [f"{len(members)} member(s) · {analysed} analysed", loaded])
+            self._tiles["project"].set_dimmed(False)
+        elif self._experiment is not None:
+            self._tiles["project"].set_summary(
+                ["standalone experiment", self._experiment.name])
+            self._tiles["project"].set_dimmed(True)
+        else:
+            self._tiles["project"].set_summary(
+                ["not a project yet", "Tools ▸ Upgrade or Create project"])
+            self._tiles["project"].set_dimmed(True)
+
+        has_exp = self._experiment is not None
+        for key in ("analyze", "qc", "plots", "scripts"):
+            self._tiles[key].set_dimmed(not has_exp)
+        if has_exp:
+            status = self._experiment.status()
+            self._tiles["analyze"].set_summary(
+                [self._experiment.type.label,
+                 f"{status.n_total or '—'} individuals"
+                 if status.analyzed else "not analysed yet"])
+            self._tiles["qc"].set_summary(
+                [f"group: {self._experiment.exclusion_group or 'none'}",
+                 f"{status.n_excluded} chamber(s) excluded"])
+            self._tiles["plots"].set_summary(
+                [f"{len(self._experiment.type.plot_ids())} figure(s) in the set",
+                 f"headline: {self._experiment.type.headline_plot_id or '—'}"])
+            self._tiles["scripts"].set_summary(
+                [f"{len(self._experiment.scripts())} experiment script(s)",
+                 f"{len(self._project.scripts()) if self._project else 0} "
+                 f"project script(s)"])
+        else:
+            for key, hint in (("analyze", "load an experiment to analyse"),
+                              ("qc", "load an experiment"),
+                              ("plots", "load an experiment"),
+                              ("scripts", "load one to run scripts")):
+                self._tiles[key].set_summary([hint, ""])
+
+        providers = self._ai_provider.count()
+        self._tiles["ai"].set_dimmed(providers == 0 or self._project is None)
+        self._tiles["ai"].set_summary(
+            [f"{providers} provider(s) configured",
+             "per-member + across-members"])
+        self._tiles["tools"].set_summary(["directory tools", ""])
+
+        rows = [("Selection", str(self._selection or "none"))]
+        if self._project is not None:
+            rows.append(("Project", f"{self._project.name} · "
+                                    f"{self._project.type.label}"))
+            if self._project.question:
+                rows.append(("Question", self._project.question))
+        if self._experiment is not None:
+            rows.append(("Experiment", f"{self._experiment.name} · "
+                                       f"{self._experiment.type.label}"))
+        else:
+            rows.append(("Experiment", "none loaded"))
+        self._status_panel.set_rows(rows)
+
+    def _refresh_tables(self) -> None:
+        self._batch_table.setRowCount(0)
+        if self._batch is not None:
+            for d in self._batch.project_dirs():
+                try:
+                    project = Project(d)
+                    type_label = project.type.label
+                    members = str(len(project.members()))
+                    report = "yes" if project.report_path.is_file() else "no"
+                except Exception as exc:  # noqa: BLE001 - a bad Project still lists
+                    type_label, members, report = f"error: {exc}", "—", "—"
+                self._append_row(self._batch_table,
+                                 [d.name, type_label, members, report])
+            self._batch_script.clear()
+            from ..script_editor import project_actions
+
+            names = project_actions.builtin_names()
+            names += [s["name"] for s in self._batch.project_scripts()]
+            self._batch_script.addItems(names)
+            if self._batch.designated_script:
+                idx = self._batch_script.findText(self._batch.designated_script)
+                if idx >= 0:
+                    self._batch_script.setCurrentIndex(idx)
+
+        self._members_table.setRowCount(0)
+        if self._project is not None:
+            for member in self._project.members():
+                st = member.status()
+                self._append_row(self._members_table, [
+                    member.name,
+                    member.type.label,
+                    str(st.n_total or "—"),
+                    (st.analyzed_at or "yes") if st.analyzed else "no",
+                    st.exclusion_group or "none",
+                ])
+            self._project_script.clear()
+            from ..script_editor import project_actions
+
+            names = [s["name"] for s in self._project.scripts()]
+            names += [n for n in project_actions.builtin_names() if n not in names]
+            self._project_script.addItems(names)
+
+    @staticmethod
+    def _append_row(table: QTableWidget, values: list[str]) -> None:
+        row = table.rowCount()
+        table.insertRow(row)
+        for col, value in enumerate(values):
+            table.setItem(row, col, QTableWidgetItem(str(value)))
+
+    def _refresh_analyze_panel(self) -> None:
+        """Rebuild the Analyze buttons from ``core ∪ type`` (ADR-0002)."""
+        layout = self._analyze_card.body_layout()
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.setParent(None)
+
+        if self._experiment is None:
+            layout.addWidget(QLabel("Load an experiment to see its actions."))
+            return
+
+        from ..script_editor import actions as action_mod
+
+        registry = action_mod.registry_for(self._experiment.type)
+        order = [k for k in action_mod.CORE_KEYS if k in registry]
+        order += [k for k in sorted(registry) if k not in order]
+        for key in order:
+            action = registry[key]
+            btn = ActionButton(action.title, action.category,
+                               icon_name=action.icon_name)
+            btn.setToolTip(action.description)
+            btn.clicked.connect(lambda _c, k=key: self._run_action(k))
+            layout.addWidget(btn)
+
+    def _refresh_scripts(self) -> None:
+        self._scripts_combo.clear()
+        if self._experiment is None:
+            return
+        from ..script_editor import project_actions
+
+        names = [s["name"] for s in self._experiment.scripts()]
+        names += [n for n in project_actions.BUILTIN_EXPERIMENT_SCRIPTS
+                  if n not in names]
+        self._scripts_combo.addItems(names)
+
+    def _refresh_exclusion_groups(self) -> None:
+        self._group_combo.clear()
+        if self._experiment is None:
+            return
+        from .. import exclusions
+
+        groups = exclusions.list_groups(self._experiment.directory)
+        self._group_combo.addItems(groups)
+        active = self._experiment.exclusion_group
+        if active:
+            idx = self._group_combo.findText(active)
+            if idx >= 0:
+                self._group_combo.setCurrentIndex(idx)
+            else:
+                self._group_combo.setEditText(active)
+
+    def _refresh_ai(self) -> None:
+        from ..ai import narrative
+
+        self._ai_provider.clear()
+        try:
+            providers = narrative.available_providers()
+        except Exception:  # noqa: BLE001 - a missing optional package is not fatal
+            providers = []
+        self._ai_provider.addItems([p.name for p in providers])
+        self._ai_status.setText(
+            "No provider configured — set ANTHROPIC_API_KEY or OPENAI_API_KEY "
+            "in your environment or a .env file." if not providers else
+            f"Ready: {', '.join(p.name for p in providers)}."
+        )
+
+    # ── running work ───────────────────────────────────────────────────────
+
+    def _spawn(self, name: str, fn) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            self._warn("A task is already running.")
+            return
+        self._log.append_line(f"▶ {name}")
+        worker = TaskWorker(name, fn)
+        worker.log_text.connect(self._log.append_line)
+        worker.figure_ready.connect(self._on_figure)
+        worker.finished_ok.connect(lambda msg: self._log.append_line(f"✔ {msg}"))
+        worker.failed.connect(lambda msg: self._log.append_line(f"✘ {msg}"))
+        worker.finished.connect(self._refresh_all)
+        self._worker = worker
         worker.start()
 
-    def _on_log_text(self, text: str) -> None:
-        for line in text.splitlines():
-            if not line.strip():
-                continue
-            self._log.append_line(line)
-            m = _SAVED_RE.match(line)
-            if m:
-                self._maybe_surface_artifact(Path(m.group(1)))
+    def _on_figure(self, title: str, figure) -> None:
+        self._plots.add_figure(title, figure)
 
-    def _on_figure_ready(self, title: str, figure) -> None:
-        self._plot_dock.add_figure(
-            title, figure, interactive=self._interactive_checkbox.isChecked()
-        )
+    def _run_action(self, key: str) -> None:
+        """Execute one Analyze button — the same action a script step names."""
+        from ..script_editor import actions as action_mod
+        from ..script_editor.spec import RunContext
 
-    def _on_task_ok(self, msg: str) -> None:
-        self._log.append_line(msg)
-
-    def _on_task_failed(self, msg: str) -> None:
-        self._log.append_line(msg)
-        QMessageBox.warning(self, "Task failed", msg)
-
-    def _maybe_surface_artifact(self, path: Path) -> None:
-        if not path.is_file():
+        experiment = self._experiment
+        if experiment is None:
             return
-        ext = path.suffix.lower()
-        key = str(path.resolve())
-        if key in self._artifact_tabs:
-            return
-        if ext in {".png", ".jpg", ".jpeg"}:
-            view = ZoomableImageView(path)
-            idx = self._plot_dock.addTab(view, icon("plot"), path.name)
-            self._plot_dock.setCurrentIndex(idx)
-            self._artifact_tabs[key] = view
-        elif ext == ".md":
-            view = ZoomableMarkdownView(path)
-            idx = self._plot_dock.addTab(view, icon("report"), path.name)
-            self._plot_dock.setCurrentIndex(idx)
-            self._artifact_tabs[key] = view
-        elif ext in {".csv", ".tsv", ".txt"}:
-            view = ZoomableTextView(path)
-            idx = self._plot_dock.addTab(view, icon("csv"), path.name)
-            self._plot_dock.setCurrentIndex(idx)
-            self._artifact_tabs[key] = view
+        action = action_mod.registry_for(experiment.type)[key]
+        figures: list = []
 
-    # ------------------------------------------------------------- guards
-
-    def _require_data(self) -> bool:
-        if self._data is None:
-            QMessageBox.information(self, "No data", "Load data first.")
-            return False
-        return True
-
-    # ----------------------------------------------------- analyze actions
-
-    def _prep_subset(self, action: str) -> tuple:
-        """Return (data, factors) after applying selection + level filters.
-
-        Returns (None, []) and shows a message if there's nothing to analyze.
-        """
-        data, selected = self._subset_data()
-        if data is None or len(data) == 0:
-            QMessageBox.information(
-                self, "No data after filtering",
-                f"{action}: every row was excluded by the active factor/level filters.",
-            )
-            return None, []
-        return data, selected
-
-    def _action_logrank_pairwise(self) -> None:
-        if not self._require_data():
-            return
-        data, _ = self._prep_subset("Log-rank pairwise")
-        if data is None:
-            return
-        def _do():
-            res = statistics.pairwise_logrank(data)
-            print("Pairwise log-rank tests:")
-            print(res.to_string(index=False))
-            return None
-        self._spawn_task("Log-rank pairwise", _do)
-
-    def _action_logrank_omnibus(self) -> None:
-        if not self._require_data():
-            return
-        data, _ = self._prep_subset("Log-rank omnibus")
-        if data is None:
-            return
-        def _do():
-            res = statistics.logrank_multi(data)
-            print("Omnibus log-rank test:")
-            for k, v in res.items():
-                print(f"  {k}: {v}")
-            return None
-        self._spawn_task("Log-rank omnibus", _do)
-
-    def _action_gehan_wilcoxon(self) -> None:
-        if not self._require_data():
-            return
-        data, _ = self._prep_subset("Gehan-Wilcoxon pairwise")
-        if data is None:
-            return
-        def _do():
-            res = statistics.pairwise_gehan_wilcoxon(data)
-            print("Pairwise Gehan-Wilcoxon tests:")
-            print(res.to_string(index=False))
-            return None
-        self._spawn_task("Gehan-Wilcoxon pairwise", _do)
-
-    def _action_hazard_ratios(self) -> None:
-        if not self._require_data():
-            return
-        data, _ = self._prep_subset("Hazard ratios")
-        if data is None:
-            return
-        def _do():
-            res = statistics.pairwise_hazard_ratios(data)
-            print("Pairwise hazard ratios:")
-            print(res.to_string(index=False))
-            return [("Hazard-ratio forest", plotting.plot_hazard_ratio_forest(res))]
-        self._spawn_task("Hazard ratios", _do)
-
-    def _action_cox_ph(self) -> None:
-        if not self._require_data():
-            return
-        data, selected = self._prep_subset("Cox PH")
-        if data is None:
-            return
-        def _do():
-            res = statistics.cox_interaction_analysis(
-                data, factors=selected, selected_factors=selected,
-            )
-            if "error" in res:
-                print(res["error"])
-                return None
-            print(f"Cox PH — factors: {selected} · n={res.get('n_subjects')}, events={res.get('n_events')}")
-            print(f"  formula: {res.get('formula')}")
-            print(
-                "  "
-                + ", ".join(
-                    f"{label}={value:{spec}}" if isinstance(value, (int, float)) else f"{label}={value}"
-                    for label, value, spec in (
-                        ("log-likelihood", res.get("log_likelihood"), ".2f"),
-                        ("AIC", res.get("AIC"), ".2f"),
-                        ("C", res.get("concordance"), ".3f"),
-                    )
-                    if value is not None
-                )
-            )
-            coefs = res.get("coefficients")
-            if coefs is not None and len(coefs):
-                print("\nCoefficients:")
-                print(coefs.to_string(index=False))
-            lr = res.get("lr_interaction")
-            if isinstance(lr, dict):
-                lr_stat = lr.get("lr_stat")
-                lr_df = lr.get("df")
-                lr_p = lr.get("p_value")
-                if lr_stat is not None and lr_p is not None:
-                    print(f"\nLR interaction test: lr_stat={lr_stat:.3f}, df={lr_df}, p={lr_p:.4f}")
-            elif len(selected) >= 2:
-                print("\nLR interaction test: not applicable.")
-            ph = res.get("ph_test")
-            if ph is not None and len(ph):
-                print("\nProportional hazards (Schoenfeld):")
-                print(ph.to_string(index=False))
-            for w in res.get("warnings", []) or []:
-                print(f"  warning: {w}")
-            self._persist_interaction_analysis(res, selected)
-            return None
-        self._spawn_task("Cox PH", _do)
-
-    def _action_rmst(self) -> None:
-        if not self._require_data():
-            return
-        data, selected = self._prep_subset("RMST")
-        if data is None:
-            return
-        tau_value = float(self._tau_spin.value()) or None
-        def _do():
-            res = statistics.rmst_interaction_analysis(
-                data, factors=selected, selected_factors=selected, tau=tau_value,
-            )
-            if "error" in res:
-                print(res["error"])
-                return None
-            print(f"RMST regression — factors: {selected} · tau={res.get('tau')}")
-            coefs = res.get("coefficients")
-            if coefs is not None and len(coefs):
-                print("\nCoefficients (hours):")
-                print(coefs.to_string(index=False))
-            for k in ("r_squared", "f_statistic", "f_p_value", "AIC", "log_likelihood"):
-                if res.get(k) is not None:
-                    print(f"  {k}: {res[k]}")
-            self._persist_interaction_analysis(res, selected)
-            return None
-        self._spawn_task("RMST regression", _do)
-
-    def _action_parametric(self) -> None:
-        if not self._require_data():
-            return
-        data, _ = self._prep_subset("Parametric AFT")
-        if data is None:
-            return
-        def _do():
-            res = statistics.fit_parametric_models(data)
-            if not res:
-                print("No parametric models could be fit.")
-                return None
-            for family, summary in res.items():
-                print(f"\n{family}:")
-                if isinstance(summary, dict):
-                    for k, v in summary.items():
-                        print(f"  {k}: {v}")
-                else:
-                    print(f"  {summary}")
-            return None
-        self._spawn_task("Parametric AFT", _do)
-
-    def _results_dir_for(self, input_path: Path) -> Path:
-        """Project-relative output dir for a given data file (``<stem>_results/``)."""
-        return self._project_dir / f"{input_path.stem}_results"
-
-    def _interaction_metadata(self, selected: list[str]) -> dict:
-        """Capture factor selection and level filters for saved analyses."""
-        return {
-            "factors_selected": list(selected),
-            "factor_level_filters": {
-                f: sorted(self._factor_allowed.get(f, set()))
-                for f in self._factors
-            },
-            "input_file": self._loaded_path.name if self._loaded_path else None,
-        }
-
-    def _persist_interaction_analysis(self, res: dict, selected: list[str]) -> None:
-        """Append a Cox/RMST result and write outputs under the results folder."""
-        if self._loaded_path is None or self._project_dir is None:
-            print("  (results not saved — no project/data file loaded)")
-            return
-        enriched = {**res, **self._interaction_metadata(selected)}
-        self._interaction_analyses.append(enriched)
-        out_dir = self._results_dir_for(self._loaded_path)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        saved = report.save_interaction_analyses(out_dir, self._interaction_analyses)
-        for path in saved:
-            print(f"Saved: {path}")
-
-    def _action_full_pipeline(self) -> None:
-        path = self._resolve_input_path()
-        if path is None:
-            return
-        excluded = self._excluded_set()
-        out_dir = self._results_dir_for(path)
-        is_excel = path.suffix.lower() == ".xlsx"
-        assume_censored = (
-            data_loader.read_assume_censored(path) if is_excel else True
-        )
-        def _do():
-            out_dir.mkdir(parents=True, exist_ok=True)
-            run_analysis(
-                input_path=path,
-                output_dir=out_dir,
-                assume_censored=assume_censored,
-                extra_excluded_chambers=excluded,
-            )
-            print(f"Saved: {out_dir / 'report.md'}")
-            return None
-        self._spawn_task("Full pipeline", _do)
-
-    # -------------------------------------------------------- plot actions
-
-    def _plot_call(self, title: str, fn) -> None:
-        if not self._require_data():
-            return
-        data, _ = self._prep_subset(title)
-        if data is None:
-            return
-        def _do():
-            lt = lifetable.compute_lifetables(data)
-            fig = fn(lt, data)
-            return [(title, fig)]
-        self._spawn_task(title, _do)
-
-    def _action_plot_km(self) -> None:
-        self._plot_call("KM curves", lambda lt, _d: plotting.plot_km_curves(lt))
-
-    def _action_plot_km_risk(self) -> None:
-        self._plot_call("KM + risk table", lambda lt, _d: plotting.plot_km_with_risk_table(lt))
-
-    def _action_plot_nelson_aalen(self) -> None:
-        self._plot_call("Nelson-Aalen", lambda lt, _d: plotting.plot_nelson_aalen(lt))
-
-    def _action_plot_hazard(self) -> None:
-        self._plot_call("Hazard rate", lambda lt, _d: plotting.plot_hazard(lt))
-
-    def _action_plot_smoothed_hazard(self) -> None:
-        self._plot_call("Smoothed hazard", lambda lt, _d: plotting.plot_smoothed_hazard(lt))
-
-    def _action_plot_mortality(self) -> None:
-        self._plot_call("Mortality (qx)", lambda lt, _d: plotting.plot_mortality(lt))
-
-    def _action_plot_number_at_risk(self) -> None:
-        self._plot_call("Number at risk", lambda lt, _d: plotting.plot_number_at_risk(lt))
-
-    def _action_plot_cumulative(self) -> None:
-        self._plot_call("Cumulative events", lambda lt, _d: plotting.plot_cumulative_events(lt))
-
-    def _action_plot_forest(self) -> None:
-        if not self._require_data():
-            return
-        data, _ = self._prep_subset("Hazard-ratio forest")
-        if data is None:
-            return
-        def _do():
-            hr = statistics.pairwise_hazard_ratios(data)
-            return [("Hazard-ratio forest", plotting.plot_hazard_ratio_forest(hr))]
-        self._spawn_task("Hazard-ratio forest", _do)
-
-    def _action_plot_distribution(self) -> None:
-        if not self._require_data():
-            return
-        data, _ = self._prep_subset("Survival distribution")
-        if data is None:
-            return
-        def _do():
-            return [("Survival distribution", plotting.plot_survival_distribution(data))]
-        self._spawn_task("Survival distribution", _do)
-
-    def _action_plot_log_log(self) -> None:
-        self._plot_call("Log-log diagnostic", lambda lt, _d: plotting.plot_log_log(lt))
-
-    # -------------------------------------------------------- tools actions
-
-    def _action_generate_report(self) -> None:
-        self._action_full_pipeline()
-
-    def _action_open_output_dir(self) -> None:
-        if self._project_dir is None:
-            QMessageBox.information(self, "No project", "Pick a project first.")
-            return
-        # Prefer the results subdir for the loaded data file; fall back to the
-        # project dir if nothing's loaded yet or the subdir doesn't exist.
-        out = None
-        if self._loaded_path is not None:
-            candidate = self._results_dir_for(self._loaded_path)
-            if candidate.is_dir():
-                out = candidate
-        target = str(out or self._project_dir)
-        try:
-            if sys.platform == "darwin":
-                subprocess.Popen(["open", target])
-            elif os.name == "nt":
-                os.startfile(target)  # type: ignore[attr-defined]
-            else:
-                subprocess.Popen(["xdg-open", target])
-        except Exception as err:  # noqa: BLE001
-            QMessageBox.warning(self, "Could not open", str(err))
-
-    def _action_clear_tabs(self) -> None:
-        # Close every tab except the OutputLog (idx 0)
-        while self._plot_dock.count() > 1:
-            w = self._plot_dock.widget(1)
-            self._plot_dock.removeTab(1)
-            if w is not None:
-                w.deleteLater()
-        self._artifact_tabs.clear()
-
-    # ---------------------------------------------------- script actions
-
-    def _run_selected_script(self) -> None:
-        item = self._scripts_list.currentItem()
-        if item is None:
-            QMessageBox.information(self, "No script selected", "Pick a script first.")
-            return
-        idx = self._scripts_list.row(item)
-        if idx >= len(self._scripts):
-            return
-        script = self._scripts[idx]
-        from ..script_editor.runner import run_script, RunContext
-
-        project_dir = self._project_dir
-        data = self._data
-        factors = self._factors
-        lifetables = self._lifetables
-        input_format = self._selected_format()
-        wide_factors = [
-            p.strip() for p in self._wide_factor_names.text().split(",") if p.strip()
-        ]
-        # Mirror the Hub's load behavior: AssumeCensored comes from the Excel
-        # PrivateData sheet; CSV is already individual-level so the flag is moot.
-        resolved_path = self._resolve_input_path()
-        if resolved_path is not None and resolved_path.suffix.lower() == ".xlsx":
-            assume_censored = data_loader.read_assume_censored(resolved_path)
-        else:
-            assume_censored = True
-
-        def _do():
+        def _job():
             ctx = RunContext(
-                project_dir=project_dir,
-                data=data,
-                factors=factors,
-                lifetables=lifetables,
-                log=lambda m: print(m),
-                figure=lambda title, fig: print(f"[figure] {title}"),
-                excluded_chambers=self._excluded_set(),
-                assume_censored=assume_censored,
-                input_format=input_format,
-                wide_factor_names=wide_factors or None,
+                project_dir=experiment.directory,
+                experiment=experiment,
+                log=print,
+                figure=lambda title, fig: figures.append((title, fig)),
+                assume_censored=experiment.type.resolve_assume_censored(
+                    experiment.config),
+                exclusion_group=experiment.exclusion_group,
             )
-            run_script(script, ctx)
-            return None
+            if key not in {"load_data", "run_analysis"}:
+                # Every other action needs data; loading it here keeps a
+                # single button click self-contained.
+                action_mod.POOL["load_data"].execute({}, ctx)
+            action.execute({}, ctx)
+            return figures or f"{action.title} complete."
 
-        self._spawn_task(f"Script: {script.get('name', '?')}", _do)
+        self._spawn(action.title, _job)
 
-    def _open_script_editor(self) -> None:
-        if self._project_dir is None:
-            QMessageBox.information(
-                self, "No project",
-                "Pick a project directory first; the editor saves "
-                "survival_scripts.yaml inside the project.",
-            )
+    # ── actions ────────────────────────────────────────────────────────────
+
+    def _action_run_batch(self) -> None:
+        if self._batch is None:
+            self._warn("Select a directory that holds Projects first.")
             return
+        batch, name = self._batch, self._batch_script.currentText()
+        self._spawn(f"Batch run: {name}",
+                    lambda: batch.run(name, log=print).summary())
+
+    def _action_run_project_script(self) -> None:
+        if self._project is None:
+            self._warn("No Project selected.")
+            return
+        from ..script_editor import project_actions
+
+        project, name = self._project, self._project_script.currentText()
+        steps = None
+        for script in project.scripts():
+            if script.get("name") == name:
+                steps = list(script.get("steps") or [])
+        steps = steps if steps is not None else project_actions.builtin_steps(name)
+        if steps is None:
+            self._warn(f"No Project Script named {name!r}.")
+            return
+
+        def _job():
+            project_actions.run_script(project, steps, log=print)
+            return f"Project script {name!r} complete."
+
+        self._spawn(f"Project script: {name}", _job)
+
+    def _action_project_report(self, with_narrative: bool = False) -> None:
+        if self._project is None:
+            self._warn("No Project selected.")
+            return
+        from .. import project_report
+        from ..ai import narrative as ai_narrative
+
+        project = self._project
+
+        def _job():
+            text = None
+            if with_narrative:
+                text = ai_narrative.generate(project, log=print)
+            written = project_report.write_project_report(
+                project, narrative=text, log=print)
+            return f"Project report: {written.get('pdf') or written.get('md')}"
+
+        self._spawn("Project report", _job)
+
+    def _action_validate_project(self) -> None:
+        if self._project is None:
+            self._warn("No Project selected.")
+            return
+        problems = self._project.validate()
+        if problems:
+            self._log.append_line("Project validation problems:")
+            for p in problems:
+                self._log.append_line(f"  - {p}")
+        else:
+            self._log.append_line("Project validation passed.")
+        for divergence in self._project.divergences():
+            self._log.append_line(f"  divergence — {divergence}")
+
+    def _action_add_member(self) -> None:
+        if self._project is None:
+            self._warn("Create or select a Project first.")
+            return
+        name = self._prompt_text("Add member", "Directory name for the new "
+                                               "Member Experiment:")
+        if not name:
+            return
+        member = self._project.add_member(name)
+        self._log.append_line(f"Scaffolded {member.directory} from the Project defaults. "
+                         f"Put its data file in {member.data_dir}.")
+        self._refresh_all()
+
+    def _action_create_project(self) -> None:
+        if self._selection is None:
+            self._warn("Open a directory first.")
+            return
+        target = self._selection
+        if is_experiment_dir(target):
+            # Writing project.yaml here would make a Project with zero members.
+            target = target.parent
+        if is_project_dir(target):
+            self._warn(f"{target} is already a Project.")
+            return
+        types = available_types()
+        labels = [t.label for t in types]
+        choice = self._prompt_choice("Create project", "Experiment type:", labels)
+        if choice is None:
+            return
+        exp_type = types[labels.index(choice)]
+        question = self._prompt_text("Create project",
+                                     "What question do these experiments address?")
+        project = Project.create(target, question=question or "",
+                                 type_key=None if exp_type.is_custom else exp_type.key)
+        self._log.append_line(f"Created {project.config_path}")
+        self._set_selection(target)
+        self._refresh_all()
+
+    def _action_set_exclusion_group(self) -> None:
+        if self._experiment is None:
+            self._warn("Load an experiment first.")
+            return
+        group = self._group_combo.currentText().strip()
+        config = dict(self._experiment.raw_config)
+        if group:
+            config["exclusions"] = {"group": group}
+        else:
+            config.pop("exclusions", None)
+        cfgmod.save_config(self._experiment.directory, config)
+        self._experiment = SurvivalExperiment(
+            self._experiment.directory,
+            defaults=self._project.defaults if self._project else {},
+            project=self._project)
+        self._log.append_line(
+            f"Active exclusion group for {self._experiment.name}: "
+            f"{group or 'none'} — written to {cfgmod.CONFIG_FILENAME} and "
+            f"stamped on every future run.")
+        self._refresh_all()
+
+    def _action_open_qc_viewer(self) -> None:
+        if self._experiment is None:
+            self._warn("Load an experiment first.")
+            return
+        from .qc_viewer import QcViewerWindow
+
+        viewer = QcViewerWindow(str(self._experiment.directory))
+        viewer.show()
+        self._qc_window = viewer
+
+    def _action_render_figures(self) -> None:
+        if self._experiment is None:
+            self._warn("Load an experiment first.")
+            return
+        from .. import pubfigures
+
+        experiment, fmt = self._experiment, self._fig_format.currentText()
+
+        def _job():
+            written = pubfigures.render_all(experiment, fmt=fmt, log=print)
+            return f"{len(written)} figure(s) in {experiment.figures_dir}"
+
+        self._spawn("Render publication figures", _job)
+
+    def _action_open_plot_editor(self) -> None:
+        if self._experiment is None:
+            self._warn("Load an experiment first — the Plot Editor is "
+                       "experiment-level here, because figures are per member.")
+            return
+        from .plot_editor import PlotEditorWindow
+
+        editor = PlotEditorWindow(self._experiment)
+        editor.show()
+        self._plot_editor = editor
+
+    def _action_run_experiment_script(self) -> None:
+        if self._experiment is None:
+            self._warn("Load an experiment first.")
+            return
+        from ..script_editor import project_actions
+
+        experiment = self._experiment
+        name = self._scripts_combo.currentText()
+        steps = None
+        for script in experiment.scripts():
+            if script.get("name") == name:
+                steps = list(script.get("steps") or [])
+        if steps is None:
+            steps = project_actions.BUILTIN_EXPERIMENT_SCRIPTS.get(name)
+        if steps is None:
+            self._warn(f"No Experiment Script named {name!r}.")
+            return
+
+        figures: list = []
+
+        def _job():
+            project_actions.run_experiment_script(
+                experiment, steps, log=print,
+                figure=lambda t, f: figures.append((t, f)))
+            return figures or f"Script {name!r} complete."
+
+        self._spawn(f"Experiment script: {name}", _job)
+
+    def _action_open_script_editor(self) -> None:
         from ..script_editor.window import ScriptEditorWindow
 
-        win = ScriptEditorWindow(self._project_dir, factors=self._factors, parent=self)
-        win.scriptsSaved.connect(self._on_scripts_saved)
-        win.show()
-
-    def _on_scripts_saved(self, path: str) -> None:
-        self._refresh_scripts_list()
-        self._log.append_line(f"Reloaded scripts from {path}.")
-
-    # -------------------------------------------------------- subprocesses
-
-    def _launch_subapp(self, which: str) -> None:
-        if self._project_dir is None:
-            QMessageBox.information(self, "No project", "Pick a project directory first.")
+        target = self._experiment.directory if self._experiment else self._selection
+        if target is None:
+            self._warn("Open a directory first.")
             return
-        cmd = [sys.executable, "-m", "pysurvanalysis", which, str(self._project_dir)]
-        try:
-            subprocess.Popen(cmd)
-        except Exception as err:  # noqa: BLE001
-            QMessageBox.warning(self, "Launch failed", str(err))
+        editor = ScriptEditorWindow(str(target))
+        editor.show()
+        self._script_editor = editor
 
-    # ----------------------------------------------------------- DnD
-
-    def dragEnterEvent(self, event):  # noqa: N802 — Qt API
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-
-    def dropEvent(self, event):  # noqa: N802 — Qt API
-        urls = event.mimeData().urls()
-        if not urls:
+    def _action_ai_narrative(self) -> None:
+        if self._project is None:
+            self._warn("The narrative is written per Project.")
             return
-        p = Path(urls[0].toLocalFile())
-        if p.is_dir():
-            self._set_project_dir(p)
-        elif p.is_file():
-            self._set_project_dir(p.parent)
+        from ..ai import narrative as ai_narrative
+
+        project = self._project
+        provider = self._ai_provider.currentText() or None
+
+        def _job():
+            text = ai_narrative.generate(project, provider=provider, log=print)
+            for name, paragraph in text.items():
+                print(f"\n[{name}]\n{paragraph}")
+            return f"{len(text)} narrative section(s)."
+
+        self._spawn("AI narrative", _job)
+
+    def _action_upgrade(self) -> None:
+        if self._selection is None:
+            self._warn("Open a directory first.")
+            return
+        plan = upgrade_mod.plan(self._selection)
+        if plan.is_noop:
+            self._log.append_line("Nothing to upgrade: " + "; ".join(plan.warnings))
+            return
+        message = ("This will:\n  - " + "\n  - ".join(plan.actions)
+                   + ("\n\nNotes:\n  - " + "\n  - ".join(plan.warnings)
+                      if plan.warnings else "")
+                   + "\n\nNothing is deleted or moved.")
+        if QMessageBox.question(self, "Upgrade directory", message) \
+                != QMessageBox.StandardButton.Yes:
+            return
+        upgrade_mod.apply(plan)
+        self._log.append_line(f"Upgraded {plan.directory}.")
+        self._set_selection(plan.directory)
+        self._refresh_all()
+
+    def _action_wrap_in_project(self) -> None:
+        if self._experiment is None:
+            self._warn("Load a standalone experiment first.")
+            return
+        parent = self._experiment.directory.parent
+        if is_project_dir(parent):
+            self._warn(f"{parent} is already a Project.")
+            return
+        project = Project.create(
+            parent,
+            type_key=None if self._experiment.type.is_custom
+            else self._experiment.type.key)
+        self._log.append_line(f"Wrapped {self._experiment.name} in {project.config_path}")
+        self._set_selection(parent)
+        self._refresh_all()
+
+    def _action_validate_config(self) -> None:
+        if self._experiment is None:
+            self._warn("Load an experiment first.")
+            return
+        problems = self._experiment.validate()
+        if problems:
+            self._log.append_line(f"{self._experiment.name} config problems:")
+            for p in problems:
+                self._log.append_line(f"  - {p}")
+        else:
+            self._log.append_line(f"{self._experiment.name}: config is valid.")
+
+    def _action_open_analysis(self) -> None:
+        import subprocess
+
+        target = (self._experiment.analysis_dir if self._experiment
+                  else self._selection)
+        if target is None:
+            return
+        target.mkdir(parents=True, exist_ok=True)
+        subprocess.Popen(["xdg-open", str(target)])
+
+    # ── small dialogs ──────────────────────────────────────────────────────
+
+    def _warn(self, message: str) -> None:
+        self._log.append_line(f"! {message}")
+        QMessageBox.warning(self, "pySurvAnalysis", message)
+
+    def _prompt_text(self, title: str, label: str) -> str | None:
+        from PyQt6.QtWidgets import QInputDialog
+
+        text, ok = QInputDialog.getText(self, title, label, QLineEdit.EchoMode.Normal)
+        return text.strip() if ok else None
+
+    def _prompt_choice(self, title: str, label: str,
+                       options: list[str]) -> str | None:
+        from PyQt6.QtWidgets import QInputDialog
+
+        text, ok = QInputDialog.getItem(self, title, label, options, 0, False)
+        return text if ok else None
+
+    def _toggle_theme(self) -> None:
+        mode = "light" if current_mode() == "dark" else "dark"
+        apply_theme(QApplication.instance(), mode)
+        ui_settings.set_value("theme", mode)
+        for tile in self._tiles.values():
+            tile.restyle()
+        self._status_panel.restyle()
+        for panel in self._panels.values():
+            panel.restyle()
 
 
 def main() -> None:
-    app = QApplication.instance() or QApplication(sys.argv)
+    app = QApplication(sys.argv)
     apply_theme(app, ui_settings.get("theme", "auto"))
     initial = sys.argv[1] if len(sys.argv) > 1 else None
-    win = HubWindow(initial)
-    win.show()
+    window = HubWindow(initial)
+    window.show()
     sys.exit(app.exec())
 
 

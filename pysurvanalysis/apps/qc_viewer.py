@@ -279,17 +279,30 @@ class QcViewerWindow(QMainWindow):
     def _reload_data(self) -> None:
         if self._project_dir is None:
             return
-        # Find an input file: prefer .xlsx, fall back to first .csv/.tsv
+        # An Experiment Directory names its own data file (config first, then
+        # data/, then the root); a bare folder still gets the old glob.
         path: Path | None = None
-        for pattern in ("*.xlsx", "*.csv", "*.tsv"):
-            files = list(self._project_dir.glob(pattern))
-            if files:
-                path = files[0]
-                break
+        try:
+            from ..domain import SurvivalExperiment, is_experiment_dir
+
+            if is_experiment_dir(self._project_dir):
+                path = SurvivalExperiment(self._project_dir).data_file()
+        except Exception:  # noqa: BLE001 - fall through to the glob
+            path = None
+        if path is None:
+            for base in (self._project_dir / "data", self._project_dir):
+                for pattern in ("*.xlsx", "*.csv", "*.tsv"):
+                    files = sorted(base.glob(pattern)) if base.is_dir() else []
+                    if files:
+                        path = files[0]
+                        break
+                if path is not None:
+                    break
         if path is None:
             QMessageBox.warning(
                 self, "No data",
-                "No .xlsx, .csv, or .tsv file found in the project directory.",
+                "No .xlsx, .csv, or .tsv file found in this directory or its "
+                "data/ subdirectory.",
             )
             return
         try:

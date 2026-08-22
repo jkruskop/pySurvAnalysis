@@ -22,6 +22,10 @@ _GLYPHS: dict[str, tuple[str, Category | None]] = {
     "qc":            ("fa5s.search",               Category.QC),
     "scripts":       ("fa5s.scroll",               Category.SCRIPTS),
     "tools":         ("fa5s.tools",                Category.TOOLS),
+    "batch":         ("fa5s.layer-group",          Category.NEUTRAL),
+    "experiment":    ("fa5s.flask",                Category.NEUTRAL),
+    "analyze":       ("fa5s.microscope",           Category.ANALYZE),
+    "ai":            ("fa5s.robot",                Category.AI),
     "settings":      ("fa5s.cog",                  Category.NEUTRAL),
     "theme_dark":    ("fa5s.moon",                 Category.NEUTRAL),
     "theme_light":   ("fa5s.sun",                  Category.NEUTRAL),
@@ -68,6 +72,10 @@ _GLYPHS: dict[str, tuple[str, Category | None]] = {
     "menu":          ("fa5s.ellipsis-v",           Category.NEUTRAL),
     "delete":        ("fa5s.times-circle",         Category.QC),
     "check":         ("fa5s.check-circle",         Category.ANALYZE),
+    "upgrade":       ("fa5s.level-up-alt",         Category.TOOLS),
+    "figures":       ("fa5s.image",                Category.PLOTS),
+    "interaction":   ("fa5s.random",               Category.PLOTS),
+    "validate":      ("fa5s.clipboard-check",      Category.TOOLS),
 }
 
 

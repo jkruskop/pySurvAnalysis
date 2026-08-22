@@ -24,6 +24,7 @@ class Category(str, Enum):
     PLOTS = "plots"
     QC = "qc"
     SCRIPTS = "scripts"
+    AI = "ai"
     TOOLS = "tools"
     NEUTRAL = "neutral"
 
@@ -43,6 +44,7 @@ PALETTE: dict[Category, CategoryColors] = {
     Category.PLOTS:   CategoryColors("#ea580c", "#fb923c"),
     Category.QC:      CategoryColors("#dc2626", "#f87171"),
     Category.SCRIPTS: CategoryColors("#9333ea", "#a855f7"),
+    Category.AI:      CategoryColors("#0d9488", "#2dd4bf"),
     Category.TOOLS:   CategoryColors("#475569", "#94a3b8"),
     Category.NEUTRAL: CategoryColors("#64748b", "#94a3b8"),
 }
@@ -77,9 +79,30 @@ def _resolve_auto() -> Literal["light", "dark"]:
         return "light"
 
 
+def surface_colors() -> dict:
+    """Explicit surface colors for the resolved theme.
+
+    qdarktheme leaves the Window/Base/Mid palette roles at the platform's
+    LIGHT values, so styles written as ``palette(base)`` render light chips
+    with unreadable text on the dark UI. Every custom surface resolves here.
+    """
+    if _resolved_mode == "dark":
+        return {"base": "#1f2226", "band": "#26292d", "border": "#3f444b",
+                "hover": "#33383e", "text": "#e1e5e9", "muted": "#8b949e"}
+    return {"base": "#ffffff", "band": "#f4f5f7", "border": "#c4c8cc",
+            "hover": "#e4e7ea", "text": "#0f172a", "muted": "#64748b"}
+
+
 def _additional_qss() -> str:
     """QSS appended to qdarktheme's stylesheet for pySurvAnalysis widgets."""
-    return """
+    # Cards paint their own background (autoFillBackground on a custom Window
+    # role), which leaves plain QLabels inside them at qdarktheme's washed-out
+    # default. Give every label in a card the resolved text colour.
+    text = surface_colors()["text"]
+    return f"""
+    QFrame#PsurvCard QLabel {{ color: {text}; }}
+    QFrame#PsurvCard QLabel#PsurvCardSubtitle {{ color: {surface_colors()["muted"]}; }}
+    """ + """
     QPushButton#PsurvSidebarItem {
         text-align: left;
         padding: 8px 12px;

@@ -5,7 +5,8 @@ Vendored from PyTrackingAnalysis with ``Ptrack*`` objectNames renamed to
 """
 
 from .icons import icon
-from .theme import Category, ThemeMode, apply_theme, category_color, current_mode, resolved_mode
+from .theme import (Category, ThemeMode, apply_theme, category_color, current_mode,
+                    resolved_mode, surface_colors)
 from .widgets import ActionButton, Card, OutputLog, PlotDock, SidebarNav, TopBar
 from .zoom import ZoomableImageView, ZoomableMarkdownView, ZoomableTextView
 
@@ -26,4 +27,5 @@ __all__ = [
     "current_mode",
     "icon",
     "resolved_mode",
+    "surface_colors",
 ]

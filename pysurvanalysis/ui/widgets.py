@@ -179,10 +179,15 @@ class Card(QFrame):
 
         self._title_lbl = QLabel(title, self)
         self._title_lbl.setObjectName("PsurvCardTitle")
+        # An explicit colour: with autoFillBackground on a custom Window role,
+        # qdarktheme leaves QLabel at a washed-out default in dark mode.
+        from .theme import surface_colors
+
         self._title_lbl.setStyleSheet(
             f"QLabel#PsurvCardTitle {{ "
             f"  border-left: 4px solid {category_color(category)};"
             f"  padding-left: 8px;"
+            f"  color: {surface_colors()['text']};"
             f"}}"
         )
         title_row.addWidget(self._title_lbl, 1)
@@ -199,12 +204,21 @@ class Card(QFrame):
         self._body.setSpacing(8)
         outer.addLayout(self._body)
 
-        pal = self.palette()
-        base = pal.color(QPalette.ColorRole.Base)
-        bg = base.lighter(102) if resolved_mode() == "light" else base.lighter(115)
-        pal.setColor(QPalette.ColorRole.Window, bg)
-        self.setAutoFillBackground(True)
-        self.setPalette(pal)
+        # qdarktheme leaves the Base palette role at the platform's LIGHT value,
+        # so deriving the card background from it painted white cards on the
+        # dark UI. Resolve the surface explicitly instead.
+        from .theme import surface_colors
+
+        chrome = surface_colors()
+        self.setStyleSheet(
+            f"QFrame#PsurvCard {{ background: {chrome['base']}; "
+            f"border: 1px solid {chrome['border']}; border-radius: 10px; }}"
+            f"QFrame#PsurvCard QLabel {{ color: {chrome['text']}; "
+            f"background: transparent; }}"
+            f"QFrame#PsurvCard QLabel#PsurvCardSubtitle {{ "
+            f"color: {chrome['muted']}; }}"
+        )
+        self.setAutoFillBackground(False)
 
     def body_layout(self) -> QVBoxLayout:
         return self._body

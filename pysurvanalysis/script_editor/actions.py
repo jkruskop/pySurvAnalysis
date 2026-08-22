@@ -7,86 +7,15 @@ The registry mirrors PyTrackingAnalysis's pattern.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from ..ui import Category
+from .spec import Action, ParamSpec, ProjectRunContext, RunContext  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
 # Specs
 # ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class ParamSpec:
-    """Describes one parameter of an action.
-
-    ``kind`` picks the inspector widget:
-
-    * ``"string"`` → QLineEdit
-    * ``"int"``    → QSpinBox
-    * ``"float"``  → QDoubleSpinBox
-    * ``"bool"``   → QCheckBox
-    * ``"choice"`` → QComboBox (requires ``choices`` or "factor")
-    * ``"path"``   → QLineEdit + browse button
-    * ``"list"``   → QLineEdit (comma-separated)
-    * ``"factors"``→ QListWidget multi-select of factor names (resolved at runtime)
-    """
-
-    name: str
-    kind: str
-    label: str
-    default: Any = None
-    help: str = ""
-    choices: tuple[str, ...] | None = None
-    min: float | None = None
-    max: float | None = None
-    enabled_when: str | None = None
-
-
-@dataclass
-class RunContext:
-    """State threaded through a script run.
-
-    Experimental design (time/event columns, factor names) is read from the
-    data file itself; only the input *format* and a couple of toggles need
-    to be passed explicitly. ``wide_factor_names`` is required for csv_wide.
-    """
-
-    project_dir: Any = None
-    data: Any = None  # individual-level DataFrame
-    factors: list[str] | None = None
-    lifetables: Any = None
-    log: Callable[[str], None] = lambda _msg: None
-    figure: Callable[[str, Any], None] = lambda _title, _fig: None
-    excluded_chambers: set | None = None
-    assume_censored: bool = True
-    input_format: str = "excel"  # excel | csv (auto long/wide) | csv_long | csv_wide
-    wide_factor_names: list[str] | None = None
-
-
-@dataclass
-class Action:
-    key: str
-    title: str
-    description: str
-    category: Category
-    icon_name: str
-    params: tuple[ParamSpec, ...]
-    execute_fn: Callable[[dict, RunContext], None] | None = None
-    applicable_formats: tuple[str, ...] | None = None
-
-    def execute(self, params: dict, ctx: RunContext) -> None:
-        if self.execute_fn is None:
-            raise NotImplementedError(f"Action {self.key!r} has no execute function")
-        merged: dict[str, Any] = {}
-        for spec in self.params:
-            if spec.name in params:
-                merged[spec.name] = params[spec.name]
-            elif spec.default is not None:
-                merged[spec.name] = spec.default
-        self.execute_fn(merged, ctx)
-
 
 def _parse_list(s: Any) -> list:
     if s is None:
@@ -109,6 +38,20 @@ def _require_data(ctx: RunContext, action: str) -> None:
 
 def _exec_load_data(params: dict, ctx: RunContext) -> None:
     from .. import data_loader
+
+    # An Experiment Directory is self-describing: its config names the format,
+    # the columns, the censoring policy and the Exclusion Group, so nothing has
+    # to be guessed from the run context.
+    if ctx.experiment is not None:
+        data, factors = ctx.experiment.load(extra_excluded=ctx.excluded_chambers)
+        ctx.data, ctx.factors = data, factors
+        ctx.exclusion_group = ctx.experiment.exclusion_group
+        group = f" · exclusion group '{ctx.exclusion_group}'" if ctx.exclusion_group else ""
+        ctx.log(
+            f"Loaded {len(data)} individuals · {data['treatment'].nunique()} "
+            f"treatments · factors={factors}{group}"
+        )
+        return
 
     if ctx.project_dir is None:
         raise RuntimeError("load_data: no project directory in context")
@@ -158,11 +101,14 @@ def _exec_load_data(params: dict, ctx: RunContext) -> None:
 def _exec_apply_exclusions(params: dict, ctx: RunContext) -> None:
     from .. import exclusions
 
-    if ctx.project_dir is None:
-        raise RuntimeError("apply_exclusions: no project directory in context")
+    directory = (ctx.experiment.directory if ctx.experiment is not None
+                 else ctx.project_dir)
+    if directory is None:
+        raise RuntimeError("apply_exclusions: no experiment directory in context")
     group = params.get("group", "default")
-    chambers = exclusions.chambers_for_group(ctx.project_dir, group)
+    chambers = exclusions.chambers_for_group(directory, group)
     ctx.excluded_chambers = (ctx.excluded_chambers or set()) | chambers
+    ctx.exclusion_group = group
     ctx.log(f"Applied {len(chambers)} chamber exclusion(s) from group '{group}'.")
     if ctx.data is not None and "chamber" in ctx.data.columns and chambers:
         before = len(ctx.data)
@@ -359,13 +305,52 @@ def _exec_chamber_qc(params: dict, ctx: RunContext) -> None:
         )
 
 
+def _exec_run_analysis(params: dict, ctx: RunContext) -> None:
+    """Run the Experiment Type's whole battery and write ``analysis/``."""
+    if ctx.experiment is None:
+        raise RuntimeError(
+            "run_analysis: no experiment loaded — this action needs an "
+            "Experiment Directory."
+        )
+    result = ctx.experiment.run_analysis(
+        log=ctx.log, extra_excluded=ctx.excluded_chambers,
+    )
+    ctx.result = result
+    ctx.data = result.individual_data
+    ctx.factors = result.factors
+    ctx.lifetables = result.lifetables
+    ctx.log(f"Analysis written to {result.output_dir}")
+
+
+def _exec_render_publication_figures(params: dict, ctx: RunContext) -> None:
+    from .. import pubfigures
+
+    if ctx.experiment is None:
+        raise RuntimeError(
+            "render_publication_figures: no experiment loaded."
+        )
+    fmt = str(params.get("format") or "svg")
+    written = pubfigures.render_all(ctx.experiment, fmt=fmt, log=ctx.log)
+    ctx.log(f"{len(written)} publication figure(s) in {ctx.experiment.figures_dir}")
+
+
 def _exec_report(params: dict, ctx: RunContext) -> None:
+    from .. import report_builder
     from ..pipeline import run_analysis
 
+    if ctx.experiment is not None:
+        result = ctx.result
+        if result is None:
+            result = ctx.experiment.run_analysis(
+                log=ctx.log, extra_excluded=ctx.excluded_chambers)
+            ctx.result = result
+        else:
+            report_builder.write_experiment_report(result, result.output_dir)
+        ctx.log(f"Report: {result.output_dir}")
+        return
+
     if ctx.project_dir is None:
-        raise RuntimeError("report: no project directory in context")
-    # Empty/None output_dir lets pipeline.run_analysis derive
-    # <project>/<datafile_stem>_results/ — the project-wide convention.
+        raise RuntimeError("report: no experiment or directory in context")
     out = params.get("output_dir") or None
     result = run_analysis(
         input_path=str(ctx.project_dir),
@@ -380,7 +365,7 @@ def _exec_report(params: dict, ctx: RunContext) -> None:
 # Registry
 # ---------------------------------------------------------------------------
 
-ACTIONS: dict[str, Action] = {
+POOL: dict[str, Action] = {
     "load_data": Action(
         key="load_data",
         title="Load data",
@@ -542,8 +527,11 @@ ACTIONS: dict[str, Action] = {
     ),
     "report": Action(
         key="report",
-        title="Generate report.md",
-        description="Run the full analysis pipeline and write report.md.",
+        title="Generate report",
+        description=(
+            "Write the experiment report (PDF and markdown) from the current "
+            "analysis, running it first if nothing has been computed yet."
+        ),
         category=Category.TOOLS,
         icon_name="report",
         params=(
@@ -552,3 +540,93 @@ ACTIONS: dict[str, Action] = {
         execute_fn=_exec_report,
     ),
 }
+
+POOL["run_analysis"] = Action(
+    key="run_analysis",
+    title="Run analysis",
+    description=(
+        "Run the Experiment Type's whole battery — its analyses and its Plot "
+        "Set — and write everything under analysis/."
+    ),
+    category=Category.ANALYZE,
+    icon_name="analyze",
+    params=(),
+    execute_fn=_exec_run_analysis,
+)
+POOL["render_publication_figures"] = Action(
+    key="render_publication_figures",
+    title="Render publication figures",
+    description="Write the vector Publication Figures from plot_specs.yaml.",
+    category=Category.PLOTS,
+    icon_name="figures",
+    params=(
+        ParamSpec("format", "choice", "Format", default="svg",
+                  choices=("svg", "pdf", "png")),
+    ),
+    execute_fn=_exec_render_publication_figures,
+)
+
+
+# ---------------------------------------------------------------------------
+# core ∪ type (ADR-0002)
+#
+# The core holds what every Experiment Type has; the type contributes the rest,
+# and a Hub button and its script action are the same declaration. A step
+# naming an action outside the union is a hard error — see :func:`validate_steps`.
+# ---------------------------------------------------------------------------
+
+CORE_KEYS: tuple[str, ...] = (
+    "load_data",
+    "apply_exclusions",
+    "filter",
+    "run_analysis",
+    "chamber_overlay_qc",
+    "render_publication_figures",
+    "report",
+)
+
+
+def registry_for(exp_type=None) -> dict[str, Action]:
+    """The actions available to *exp_type*: core ∪ type.
+
+    A Custom Experiment (or no type at all) gets everything in the pool — the
+    absence of a type is the absence of a constraint.
+    """
+    core = {k: POOL[k] for k in CORE_KEYS if k in POOL}
+    if exp_type is None or getattr(exp_type, "is_custom", False):
+        merged = dict(POOL)
+        merged.update(core)
+        return merged
+
+    registry = dict(core)
+    for key in (exp_type.action_keys or ()):
+        if key in POOL:
+            registry[key] = POOL[key]
+    for action in exp_type.extra_actions():
+        registry[action.key] = action
+    return registry
+
+
+def validate_steps(steps, exp_type=None) -> list[str]:
+    """Problems that must stop a run before its first step executes.
+
+    Unknown actions are a hard error rather than a skip: a silently skipped
+    analysis step produces a report that looks complete and is not.
+    """
+    registry = registry_for(exp_type)
+    label = getattr(exp_type, "label", "Custom Experiment")
+    problems: list[str] = []
+    for i, step in enumerate(steps or [], 1):
+        key = (step or {}).get("action")
+        if not key:
+            problems.append(f"Step {i} has no action.")
+        elif key not in registry:
+            problems.append(
+                f"Step {i} uses action {key!r}, which a {label} does not provide. "
+                f"Available: {', '.join(sorted(registry))}."
+            )
+    return problems
+
+
+#: Backwards-compatible view: every action this build knows about.
+ACTIONS: dict[str, Action] = dict(POOL)

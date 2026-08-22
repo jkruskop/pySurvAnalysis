@@ -23,6 +23,24 @@ from pathlib import Path
 from typing import Iterable
 
 _FILENAME = "remove_chambers.csv"
+_QC_SUBDIR = "qc"
+
+
+def exclusions_path(experiment_dir: str | Path) -> Path:
+    """Where an Experiment Directory's exclusion file lives.
+
+    Canonically ``qc/remove_chambers.csv``. A pre-overhaul directory keeps its
+    copy at the root; that copy is honoured for reading but new writes go to
+    ``qc/`` (see :mod:`pysurvanalysis.domain.upgrade`).
+    """
+    base = Path(experiment_dir)
+    qc = base / _QC_SUBDIR / _FILENAME
+    if qc.is_file():
+        return qc
+    legacy = base / _FILENAME
+    if legacy.is_file():
+        return legacy
+    return qc
 _FIELDNAMES = ["group", "chamber", "note"]
 
 
@@ -43,7 +61,7 @@ def read_exclusions(project_dir: str | Path) -> dict[str, list]:
     Returns an empty dict if the file does not exist or cannot be parsed.
     Chamber lists are sorted (numerically when possible).
     """
-    path = Path(project_dir) / _FILENAME
+    path = exclusions_path(project_dir)
     if not path.exists():
         return {}
     result: dict[str, list] = {}
@@ -72,7 +90,7 @@ def read_exclusions(project_dir: str | Path) -> dict[str, list]:
 
 def list_groups(project_dir: str | Path) -> list[str]:
     """Return group names in the order they first appear in the CSV."""
-    path = Path(project_dir) / _FILENAME
+    path = exclusions_path(project_dir)
     if not path.exists():
         return []
     seen: list[str] = []
@@ -103,7 +121,7 @@ def write_exclusions(
     Parameters
     ----------
     project_dir:
-        Project root directory (``remove_chambers.csv`` lives here).
+        Experiment Directory (the file lives in its ``qc/`` subdirectory).
     group:
         Name of the exclusion group to update (e.g. ``"default"``).
     chambers:
@@ -117,7 +135,8 @@ def write_exclusions(
     Path
         Absolute path to the written ``remove_chambers.csv``.
     """
-    path = Path(project_dir) / _FILENAME
+    path = exclusions_path(project_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
     notes = notes or {}
 
     existing_rows: list[dict] = []

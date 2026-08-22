@@ -1,0 +1,276 @@
+# pySurvAnalysis
+
+Survival/demography analysis pipeline and desktop UI for lifespan experiments
+(DLife Excel workbooks and CSV/TSV cohorts). This glossary fixes the domain
+language; it is not a spec.
+
+Structurally modelled on PyTrackingAnalysis (Batch → Project → Experiment,
+tile-strip Hub, two-level scripting, Experiment Types, publication figures),
+with one deliberate divergence: **Projects here never pool.**
+
+## Language
+
+**Batch**:
+A directory whose immediate subdirectories holding a `project.yaml` are its
+Projects. Purely a processing convenience for running many Projects
+unattended; it holds no analysis of its own and never combines results.
+_Avoid_: study, collection, batch root
+
+**Project**:
+A directory with a `project.yaml` at its root whose immediate subdirectories
+holding a `survival_config.yaml` are its **Member Experiments** — a set of
+independently analyzed experiments addressing one question in slightly
+different ways. A Project never pools its members.
+_Avoid_: batch parent, parent directory
+
+**Project Defaults**:
+The `defaults:` section of `project.yaml` — a seed and template inherited by
+Member Experiments unless a member overrides it (design factors, quality
+criteria, plotting conventions). It is *not* an authority: the only value
+hard-validated across members is the **Experiment Type**. Divergence in
+factors, levels, treatments or chamber counts is legal and merely reported.
+_Avoid_: design (the PyTrackingAnalysis term, which IS an authority and
+implies pooling)
+
+**Member Experiment**:
+An Experiment that belongs to a Project — analyzed entirely on its own,
+related to its siblings by the *question* they address rather than by an
+identical design.
+_Avoid_: replicate (implies same-design repeats and pooling — the very thing
+this app does not do), arm, variant
+
+**Experiment Directory**:
+One cohort's directory — `survival_config.yaml` at its root, the input
+workbook/CSV at the root or in `data/`, all outputs in `analysis/`, QC state
+in `qc/` — either standalone or as a Member Experiment inside a Project.
+_Avoid_: project directory (the pre-overhaul name), results folder,
+`<stem>_results/` (the superseded output convention)
+
+**Experiment Type**:
+A named bundle that constrains an Experiment — the expected input shape, the
+time unit and axis label, the censoring policy, the default quality criteria,
+the set of analyses that run, the **Plot Set**, and the report sections. It is
+the top-level thing a scientist chooses; everything else is derived or
+constrained from it. All Member Experiments of a Project share one.
+_Avoid_: assay, protocol, template
+
+**Standard Lifespan**:
+The baseline Experiment Type: a DLife census workbook of chambers/vials scored
+to death, assumed censoring on, the full plot and statistics battery.
+
+**Interaction Experiment**:
+An Experiment Type for a 2×2 factorial — exactly two user-named factors with
+exactly two ordered levels each (e.g. Genotype × Treatment). Its standard
+analysis is the factorial battery (Cox main-effects vs interaction model with
+the LR omnibus and Schoenfeld PH test, plus the RMST pseudo-value companion),
+and it carries its own Plot Set. A factor with ≠2 levels, or a level present
+in the data but not declared, is a load error.
+_Avoid_: factorial design (the design is 2×2; the *type* is the bundle),
+2x2 experiment
+
+**Reference Level**:
+The first level listed for a factor in an Interaction Experiment's `factors:`
+block. It is the Cox dummy-coding baseline, the first cell in every plot, and
+the baseline in the report's prose, so the sign of every coefficient — the
+interaction term included — is stable and explainable regardless of how the
+levels are named.
+_Avoid_: control, baseline level, first group
+
+**Custom Experiment**:
+The absence of a chosen Experiment Type — today's freeform mode, where all
+discovered factors get the full battery. A config with no `experiment_type`
+key IS a Custom Experiment.
+_Avoid_: generic, freeform, none, untyped
+
+**Plot Set**:
+The ordered list of figures an Experiment Type produces as its standard
+output — what the report embeds and what the Plot Editor offers. Standard
+Lifespan's is the general survivorship battery; an Interaction Experiment's is
+the faceted KM (its **Headline Figure**), the four-cell KM with at-risk
+counts, the lifespan interaction plot, the Cox forest including the
+interaction term, and the log-log PH diagnostic.
+_Avoid_: plot list, figure set
+
+**Headline Figure**:
+The one figure of a Plot Set that states the experiment's primary result —
+the faceted KM for an Interaction Experiment. It leads the report and is the
+default plot the Plot Editor opens.
+_Avoid_: main plot, key figure
+
+**Publication Figure**:
+A hand-curated, journal-ready vector figure (SVG with editable text, or PDF)
+rendered by plotnine from a Plot Spec + Plot Style — distinct from the
+matplotlib figures the Hub previews and the QC Viewer draws.
+_Avoid_: report figure, plot export
+
+**Plot Style**:
+A named, reusable look shared by every Publication Figure that references it:
+figure size, theme, fonts, curve and censor-tick styling, whether the
+at-risk band is drawn and at which times, and the treatment→colour mapping.
+_Avoid_: theme (a plotnine theme is one field inside a style)
+
+**Plot Spec**:
+One Publication Figure's content decisions — axis labels, treatment and facet
+inclusion/order/display names, axis limits, reference line — plus the name of
+the Plot Style it uses.
+_Avoid_: plot config, settings
+
+**At-Risk Band**:
+The number-at-risk counts drawn as a `geom_text` layer in a reserved band
+below the curves *inside the same ggplot*, rather than as a separate axes.
+Keeps a Publication Figure one grammar object, so faceting, theming and
+vector export need no figure composition.
+_Avoid_: risk table (the matplotlib two-axes construction in `plotting.py`,
+which remains what the Hub preview and QC Viewer use)
+
+**Analysis Hub**:
+The main app: a horizontal tile strip — **Batch · Project · Analyze · QC ·
+Plots · Scripts · AI · Tools** — each tile showing only live status, with a
+status readout filling the strip to their right and a full-width output/plots
+area below. All controls live in a tile's anchored panel, one open at a time.
+The Analyze tile's cards are contributed by the loaded experiment's
+**Experiment Type**. The selection names the working container — a Batch, a
+Project, or a standalone Experiment Directory; a Member Experiment is loaded
+by double-clicking its row in the Project panel's members table.
+_Avoid_: sidebar card column (the pre-overhaul layout), Load tile (absorbed:
+input format, time/event columns and censoring policy now live in
+`survival_config.yaml`)
+
+**Type Action**:
+A Hub button, and the script action mirroring it, contributed by an
+Experiment Type rather than by the core — `cox_interaction` and
+`interaction_plot` for an Interaction Experiment, say. The action registry at
+each level is *core ∪ type*. A script step naming an action outside that
+union is a hard error: the script refuses to start, and in a Batch Run that
+Project is logged, counted as a failure, and the Batch continues.
+_Avoid_: plugin, extension, custom action
+
+**Experiment Script**:
+A saved, re-runnable step list of experiment-level actions. Lives in an
+Experiment Directory's `survival_config.yaml` `scripts:` — or, for Member
+Experiments, centrally in the Project's `experiment_scripts:` section, where
+one recipe serves every member without being copied. Because all members
+share one Experiment Type, the palette resolves cleanly from the Project.
+_Avoid_: recipe, macro, pipeline
+
+**Project Script**:
+A saved step list of project-level actions in `project.yaml` `scripts:` —
+same shape and visual editor as an Experiment Script, separate registry.
+The only bridge down is `run_in_experiments`, which runs a named Experiment
+Script in every Member Experiment (or just those named in its `only:` list),
+continue-on-error.
+
+**Batch Run**:
+One execution of a designated Project Script in every Project under a Batch,
+continue-on-error with per-Project log prefixes. `batch.yaml` holds that
+designation and a central `project_scripts:` section.
+
+**Project Report**:
+`<project>/<project>_report.pdf`: a cover carrying the project's question, a
+**Member Inventory** table (each member's N, deaths, % censored, factors and
+levels, treatments, analysis date), a **Divergence Note** stating where members
+differ, then one independent section per Member Experiment built from that
+member's *saved* analysis outputs. A member that has not been analyzed yields a
+"not analyzed" section rather than being silently analyzed.
+_Avoid_: combined report, pooled report
+
+**Divergence Note**:
+The Project Report's statement of where Member Experiments differ in factors,
+levels, treatments or chamber counts. Divergence is legal here, which is
+exactly why it must be declared to the reader.
+
+**AI Narrative**:
+An optional, AI-written summary attached to a report: one paragraph per Member
+Experiment from that member's own numbers, plus a closing qualitative
+"across members" paragraph on agreement and disagreement, captioned as
+non-statistical. The AI *summarizes* the pipeline's analysis; it never performs
+its own, and no numbers are ever combined. A derivative of a run — re-running
+the analysis deletes it.
+_Avoid_: AI analysis, AI interpretation, meta-analysis
+
+**Exclusion Group**:
+A named set of chambers removed from analysis, stored in `qc/remove_chambers.csv`.
+The **active** group is configuration (`exclusions: {group: ...}` in
+`survival_config.yaml`), not UI state, and its name is stamped on every report
+and Run Summary — so the same input and config always give the same result.
+The stamp reports what the group *actually removed*: a cohort with no chamber
+identities (a CSV) records the group in force and zero removals rather than
+claiming exclusions that could not have happened.
+_Avoid_: filter, exclusion set, removed vials
+
+**Chamber**:
+One vial/container of individuals, the unit of the DLife census and the unit
+an Exclusion Group removes. Individuals within a chamber share a treatment.
+_Avoid_: vial, cage, replicate
+
+**Assumed Censoring**:
+The DLife convention that individuals unaccounted for at the end of a census
+are treated as right-censored rather than dead. A per-experiment policy, set by
+the Experiment Type's default and overridable in `survival_config.yaml`.
+
+**Upgrade**:
+The non-destructive conversion of a pre-overhaul directory into an Experiment
+Directory: offered on open and available in Tools, it writes
+`survival_config.yaml` seeded by sniffing the data file, imports
+`survival_scripts.yaml` into the config's `scripts:`, copies
+`remove_chambers.csv` into `qc/`, and never touches `<stem>_results/`.
+_Avoid_: migration, conversion (Convert is a separate Batch Tool)
+
+**Run Summary**:
+`analysis/run_summary.json` — the small record of one analysis run (counts,
+factors, the Exclusion Group and how many chambers it actually removed, the
+figures written, the omnibus test, and each factorial model's headline
+numbers). The Hub's members table and the Project Report read it instead of
+re-analysing, which is what makes a bound Project Report cheap and what makes
+"not analysed" a visible state rather than an inferred one.
+_Avoid_: cache, manifest
+
+**Minimal Member Config**:
+What `Add member` writes: the least a Member Experiment must state itself,
+with everything the Project's `defaults:` supplies left out. A member that
+restates a default freezes it — later edits to the Project stop reaching that
+member — so scaffolds stay minimal on purpose.
+_Avoid_: template config, full config
+
+## Relationships
+
+- A **Batch** contains many **Projects**; a **Project** contains many
+  **Member Experiments**; each Member Experiment is an **Experiment Directory**.
+- An Experiment Directory may also stand alone, with no Project above it.
+- Every Member Experiment of a Project shares that Project's **Experiment
+  Type** — the only value validated across members.
+- An **Experiment Type** owns a **Plot Set** (one of whose figures is the
+  **Headline Figure**), an analysis battery, report sections, and its
+  **Type Actions**.
+- A **Plot Spec** lives with an Experiment Directory and names a **Plot Style**
+  that lives with the Project.
+- A **Project Report** binds one section per Member Experiment; it never
+  combines their numbers.
+
+## Example dialogue
+
+> **Dev:** "Two members of this Project have different genotypes in them. Do I
+> validate that, or pool them by treatment?"
+> **Domain expert:** "Neither — they're **Member Experiments**, not replicates.
+> They ask the same question two ways. Analyse each one alone and say in the
+> **Divergence Note** that they differ."
+> **Dev:** "So what does the Project actually enforce?"
+> **Domain expert:** "Just the **Experiment Type**. If one's an **Interaction
+> Experiment** and the other's a **Standard Lifespan**, there's no coherent
+> Plot Set or Analyze panel to offer, so that's an error. Everything else in
+> `defaults:` is a starting point, not a rule."
+
+## Flagged ambiguities
+
+- "replicate" was used for a Project's children while also stating those
+  children differ in design and are never pooled — resolved: they are
+  **Member Experiments**; "replicate" is reserved for nothing in this repo.
+- Output paths were a function of the data filename (`<stem>_results/`) —
+  resolved: fixed `analysis/`, so no path helper has to discover the data
+  file first and renaming a workbook cannot orphan results.
+- A 2×2's reference levels were implicit (alphabetical / `drop_first`) —
+  resolved: **Reference Level** is the first declared level, making every
+  coefficient's sign stable.
+- "Load" named both an input-format dialog and the act of making an
+  experiment current — resolved: format is configuration
+  (`survival_config.yaml`), loading is a selection/double-click.

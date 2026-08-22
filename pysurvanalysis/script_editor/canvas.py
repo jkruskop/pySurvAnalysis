@@ -136,6 +136,10 @@ class Canvas(QWidget):
             self._selected_idx = keep_selection
             self.stepSelected.emit(keep_selection, self._steps[keep_selection])
 
+    def steps(self) -> list[dict]:
+        """The steps currently on the canvas."""
+        return list(self._steps)
+
     def append_step(self, step: dict) -> None:
         self._steps.append(step)
         self._rebuild()
