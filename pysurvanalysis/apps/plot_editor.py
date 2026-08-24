@@ -358,7 +358,7 @@ def main() -> None:
     app = QApplication(sys.argv)
     apply_theme(app, ui_settings.get("theme", "auto"))
     if len(sys.argv) < 2:
-        print("usage: psurv-plots <experiment-directory>")
+        print("usage: pysurv-plots <experiment-directory>")
         sys.exit(2)
     directory = Path(sys.argv[1]).resolve()
     project = Project(directory.parent) if is_project_dir(directory.parent) else None

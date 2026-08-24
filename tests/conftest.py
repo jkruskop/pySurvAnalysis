@@ -1,10 +1,12 @@
 """Shared fixtures: synthetic cohorts and scaffolded directories.
 
-Everything here is CSV-based and small, so the structural suite runs in
-seconds and never depends on a workbook that might move.
+Everything here is written on the fly and small, so the structural suite runs
+in seconds and never depends on a workbook that might move.
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -34,6 +36,44 @@ def write_cohort(path, *, factors=None, n_per_cell=25, seed=0):
     path.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(path, index=False)
     return path
+
+
+def write_dlife_workbook(path, *, chambers=4, censuses=6, sample_size=20,
+                         factors=("Genotype", "Treatment"), assume_censored=None,
+                         drop_column=None):
+    """A minimal DLife workbook: a Design sheet, a RawData census, and an
+    optional PrivateData flag.
+
+    *drop_column* omits one required column, for the validator's tests.
+    """
+    directory = Path(path).parent
+    directory.mkdir(parents=True, exist_ok=True)
+
+    design_rows = []
+    for chamber in range(1, chambers + 1):
+        row = {"Chamber": chamber, "SampleSize": sample_size, "StartTime": 0}
+        for i, factor in enumerate(factors):
+            row[factor] = ["a", "b"][(chamber >> i) & 1]
+        design_rows.append(row)
+    raw_rows = []
+    for chamber in range(1, chambers + 1):
+        for step in range(censuses):
+            raw_rows.append({"AgeH": 24 * (step + 1), "Chamber": chamber,
+                             "IntDeaths": 2, "Censored": 1 if step == 0 else 0})
+
+    design = pd.DataFrame(design_rows)
+    raw = pd.DataFrame(raw_rows)
+    if drop_column:
+        design = design.drop(columns=[drop_column], errors="ignore")
+        raw = raw.drop(columns=[drop_column], errors="ignore")
+
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        design.to_excel(writer, sheet_name="Design", index=False)
+        raw.to_excel(writer, sheet_name="RawData", index=False)
+        if assume_censored is not None:
+            pd.DataFrame([{"AssumeCensored": int(assume_censored)}]).to_excel(
+                writer, sheet_name="PrivateData", index=False)
+    return Path(path)
 
 
 def make_experiment_dir(directory, *, type_key="interaction", factors=None,

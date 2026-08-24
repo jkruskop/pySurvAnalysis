@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pysurvanalysis.domain import Batch, Project, config as cfgmod
+from pysurvanalysis.domain.batch import resolve_designated_script
+from pysurvanalysis.script_editor.project_actions import DEFAULT_PROJECT_SCRIPT_NAME
 from tests.conftest import make_experiment_dir
 
 
@@ -72,6 +74,73 @@ def test_an_unresolvable_script_name_is_a_counted_skip(tmp_path):
     result = Batch(root).run("no such script", log=lambda _m: None)
     assert len(result.failures) == 2
     assert "no Project Script named" in result.failures[0].message
+
+
+def test_no_designation_runs_each_projects_own_batch_script(tmp_path):
+    root = _batch(tmp_path)
+    ## Rewrite one Project's default so the run is identifiable, and prove
+    ## the other still runs the seeded one rather than a shared built-in.
+    project = Project(root / "proj_0")
+    project.config["scripts"] = [{"name": DEFAULT_PROJECT_SCRIPT_NAME,
+                                  "steps": [{"action": "validate_project"}]}]
+    project.save()
+
+    steps, source, _note = resolve_designated_script(None, [], project)
+    assert steps == [{"action": "validate_project"}]
+    assert source == "project.yaml scripts"
+
+    other = Project(root / "proj_1")
+    steps, _source, _note = resolve_designated_script(None, [], other)
+    assert [s["action"] for s in steps] == [s["action"] for s
+                                            in other.scripts()[0]["steps"]]
+
+
+def test_a_project_with_no_script_does_not_run(tmp_path):
+    root = _batch(tmp_path)
+    for name in ("proj_0", "proj_1"):
+        project = Project(root / name)
+        project.config["scripts"] = []
+        project.save()
+
+    logged: list[str] = []
+    result = Batch(root).run(log=logged.append)
+    assert len(result.failures) == 2
+    ## No implicit built-in fallback: it says what is missing and where to
+    ## author it, rather than silently substituting a pipeline.
+    assert "Script Editor" in result.failures[0].message
+    assert DEFAULT_PROJECT_SCRIPT_NAME in result.failures[0].message
+
+
+def test_a_renamed_default_still_runs_as_the_projects_own(tmp_path):
+    root = _batch(tmp_path)
+    project = Project(root / "proj_0")
+    project.config["scripts"] = [{"name": "my pipeline",
+                                  "steps": [{"action": "validate_project"}]}]
+    project.save()
+    steps, _source, _note = resolve_designated_script(None, [], project)
+    assert steps == [{"action": "validate_project"}]
+
+
+def test_central_scripts_win_over_a_projects_own_of_the_same_name(tmp_path):
+    root = _batch(tmp_path)
+    project = Project(root / "proj_0")
+    project.config["scripts"] = [{"name": "Shared",
+                                  "steps": [{"action": "project_report"}]}]
+    project.save()
+    central = [{"name": "Shared", "steps": [{"action": "validate_project"}]}]
+
+    steps, source, _note = resolve_designated_script("Shared", central, project)
+    assert steps == [{"action": "validate_project"}]
+    assert source.endswith("project_scripts")
+
+
+def test_the_builtin_report_pipeline_drops_uncurated_figures(tmp_path):
+    root = _batch(tmp_path)
+    project = Project(root / "proj_0")
+    steps, source, note = resolve_designated_script("Report pipeline", [], project)
+    assert source == "built-in"
+    assert "render_publication_figures" not in [s["action"] for s in steps]
+    assert "curated" in note
 
 
 def test_an_empty_batch_says_so(tmp_path):

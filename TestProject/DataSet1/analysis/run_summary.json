@@ -1,0 +1,38 @@
+{
+  "analyzed_at": "2026-08-23T12:43:26",
+  "input_file": "DataSet1.xlsx",
+  "experiment_type": "standard_lifespan",
+  "factors": [
+    "Sex",
+    "Density"
+  ],
+  "n_total": 5600,
+  "n_deaths": 777,
+  "n_censored": 4823,
+  "n_treatments": 4,
+  "n_chambers": 200,
+  "time_min": 241.93666666666667,
+  "time_max": 958.0541666666667,
+  "assume_censored": true,
+  "exclusion_group": null,
+  "n_excluded": 0,
+  "n_excluded_listed": 0,
+  "figures": {
+    "km_risk_table": "km_with_risk_table.png",
+    "km_curves": "kaplan_meier.png",
+    "survival_distribution": "survival_distribution.png",
+    "mortality": "mortality_qx.png",
+    "smoothed_hazard": "smoothed_hazard.png",
+    "nelson_aalen": "nelson_aalen.png",
+    "number_at_risk": "number_at_risk.png",
+    "hazard_ratio_forest": "hazard_ratio_forest.png",
+    "log_log": "log_log_diagnostic.png"
+  },
+  "omnibus_lr": {
+    "chi2": 740.8229,
+    "p_value": 0.0,
+    "df": 3,
+    "groups": "['Female/20x', 'Female/40x', 'Male/20x', 'Male/40x']"
+  },
+  "factorial_models": []
+}

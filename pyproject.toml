@@ -38,9 +38,10 @@ dev = [
 
 [project.scripts]
 pysurvanalysis = "main:main"
-psurv-hub = "pysurvanalysis.apps.hub:main"
-psurv-qc = "pysurvanalysis.apps.qc_viewer:main"
-psurv-plots = "pysurvanalysis.apps.plot_editor:main"
+pysurv = "pysurvanalysis.apps.hub:main"
+pysurv-hub = "pysurvanalysis.apps.hub:main"
+pysurv-qc = "pysurvanalysis.apps.qc_viewer:main"
+pysurv-plots = "pysurvanalysis.apps.plot_editor:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -87,16 +87,32 @@ def _exec_run_in_experiments(params: dict, ctx: ProjectRunContext) -> None:
 
 
 def _exec_render_publication_figures(params: dict, ctx: ProjectRunContext) -> None:
+    """Render every member's curated Publication Figures.
+
+    A member with no saved ``plots:`` is skipped rather than rendered from
+    the Experiment Type's default Specs: this action runs unattended inside a
+    Batch Run, and nobody asked for default-spec figures (ADR-0005 — Specs are
+    authored down, in the member's own ``plot_specs.yaml``).
+    """
     from .. import pubfigures
 
     fmt = str(params.get("format") or "svg")
     total = 0
-    for member in ctx.project.members():
+    rendered = 0
+    members = ctx.project.members()
+    for member in members:
+        if not pubfigures.load_specs(member.directory):
+            ctx.log(f"  [{member.name}] no curated figure specs — skipped.")
+            continue
         ctx.log(f"  [{member.name}] publication figures…")
+        rendered += 1
         total += len(pubfigures.render_all(
             member, fmt=fmt, log=lambda m, p=member.name: ctx.log(f"  [{p}] {m}")))
-    ctx.log(f"{total} publication figure(s) across "
-            f"{len(ctx.project.members())} member(s).")
+    if not rendered:
+        ctx.log("render_publication_figures: no member has curated specs — "
+                "nothing rendered. Curate figures in the Plot Editor first.")
+        return
+    ctx.log(f"{total} publication figure(s) across {rendered}/{len(members)} member(s).")
 
 
 def _exec_project_report(params: dict, ctx: ProjectRunContext) -> None:
@@ -229,6 +245,48 @@ BUILTIN_EXPERIMENT_SCRIPTS: dict[str, list[dict]] = {
         {"action": "run_analysis"},
     ],
 }
+
+
+#: The Project Script every ``project.yaml`` is created with. It is named
+#: after what it *is* — the script a Batch Run executes in this Project —
+#: rather than after the built-in it was copied from, which hid that.
+DEFAULT_PROJECT_SCRIPT_NAME = "batch"
+
+
+def default_project_script() -> dict:
+    """A fresh copy of the default Project Script, for seeding a
+    ``project.yaml``.
+
+    A copy, not a shared constant: the caller writes it into a file the user
+    then edits. Written out rather than left in code so a user reading their
+    ``project.yaml`` can see what a Batch Run will do here, and change it.
+    """
+    return {
+        "name": DEFAULT_PROJECT_SCRIPT_NAME,
+        "notes": ("Created with the project, and what a Batch Run runs here "
+                  "unless another script is designated. Analyses every member, "
+                  "renders their curated publication figures, then builds the "
+                  "project report. Edit or replace it in the Script Editor — a "
+                  "project with no script here cannot be run from the Project "
+                  "card or a Batch Run."),
+        "steps": [dict(step) for step in BUILTIN_SCRIPTS["Report pipeline"]],
+    }
+
+
+def report_pipeline_for(project) -> tuple[list[dict], str | None]:
+    """The Report pipeline as it will actually run on *project*.
+
+    The figure step is dropped up front when no member has curated Specs, so
+    an unattended run says so before it starts rather than logging a skip per
+    member. Returns ``(steps, note)``; *note* explains a dropped step.
+    """
+    from .. import pubfigures
+
+    steps = list(BUILTIN_SCRIPTS["Report pipeline"])
+    if any(pubfigures.load_specs(m.directory) for m in project.members()):
+        return [dict(s) for s in steps], None
+    kept = [dict(s) for s in steps if s.get("action") != "render_publication_figures"]
+    return kept, "no member has curated figure specs — figure step skipped"
 
 
 def builtin_steps(name: str) -> list[dict] | None:

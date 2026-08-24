@@ -89,6 +89,12 @@ class Batch:
     def run(self, script_name: str | None = None, log=None) -> BatchResult:
         """Run one Project Script in every Project, continue-on-error.
 
+        *script_name* (or, failing that, the Batch's designation) names one
+        script to run everywhere. **No designation means "each Project's own
+        ``batch`` script"** — there is no implicit built-in fallback, because
+        every ``project.yaml`` is created with one and a silent substitution
+        would hide that a Project's script had been deleted.
+
         A Project whose script refuses to start (ADR-0002: a step naming an
         action its Experiment Type does not provide is a hard error) is logged,
         counted as a failure, and the Batch moves to the next Project.
@@ -96,7 +102,7 @@ class Batch:
         from ..script_editor import project_actions
 
         emit = log or (lambda _m: None)
-        wanted = script_name or self.designated_script or "Report pipeline"
+        wanted = script_name or self.designated_script
         result = BatchResult()
 
         dirs = self.project_dirs()
@@ -113,14 +119,21 @@ class Batch:
                 result.outcomes.append(ProjectOutcome(d.name, False, str(exc)))
                 continue
 
-            steps = _resolve_script(project, self, wanted)
+            steps, _source, note = resolve_designated_script(
+                wanted, self.project_scripts(), project)
             if steps is None:
                 msg = (f"no Project Script named {wanted!r} in this Project, in "
-                       f"{cfgmod.BATCH_FILENAME}, or among the built-ins")
+                       f"{cfgmod.BATCH_FILENAME}, or among the built-ins"
+                       if wanted else
+                       "no Project Script to run — author one in the Script "
+                       "Editor (the default is named "
+                       f"{project_actions.DEFAULT_PROJECT_SCRIPT_NAME!r})")
                 emit(f"{prefix}skipped: {msg}")
                 result.outcomes.append(ProjectOutcome(d.name, False, msg))
                 continue
 
+            if note:
+                emit(f"{prefix}{note}")
             try:
                 project_actions.run_script(
                     project, steps, log=lambda m, p=prefix: emit(f"{p}{m}")
@@ -135,14 +148,44 @@ class Batch:
         return result
 
 
-def _resolve_script(project: Project, batch: "Batch", name: str) -> list[dict] | None:
-    """Find *name* in the Project, then the Batch's central set, then built-ins."""
+def resolve_designated_script(name: str | None, central_scripts: list[dict],
+                              project: Project) -> tuple[list[dict] | None, str, str | None]:
+    """Resolve the designated Project Script *name* for *project*.
+
+    Order: the Batch's central ``project_scripts:``, then the Project's own
+    ``scripts:``, then the built-ins — central first, so one recipe in
+    ``batch.yaml`` really does serve every Project.
+
+    *name* of ``None`` means "no designation": the Project runs its OWN
+    default script, the one named ``batch`` that every ``project.yaml`` is
+    created with, else its first authored script. There is deliberately no
+    built-in fallback here — a Project whose ``scripts:`` is empty does not
+    run, and says so.
+
+    Returns ``(steps, source, note)``; ``(None, "", None)`` when the name
+    resolves nowhere. *note* explains a conditionally dropped step.
+    """
     from ..script_editor import project_actions
 
-    for script in project.scripts():
+    own = {str(s.get("name")): s for s in project.scripts()}
+    if not name:
+        script = own.get(project_actions.DEFAULT_PROJECT_SCRIPT_NAME)
+        if script is None:
+            scripts = project.scripts()
+            script = scripts[0] if scripts else None
+        if script is None:
+            return None, "", None
+        return list(script.get("steps") or []), "project.yaml scripts", None
+
+    for script in central_scripts:
         if script.get("name") == name:
-            return list(script.get("steps") or [])
-    for script in batch.project_scripts():
-        if script.get("name") == name:
-            return list(script.get("steps") or [])
-    return project_actions.builtin_steps(name)
+            return list(script.get("steps") or []), f"{cfgmod.BATCH_FILENAME} project_scripts", None
+    if name in own:
+        return list(own[name].get("steps") or []), "project.yaml scripts", None
+    if name == "Report pipeline":
+        steps, note = project_actions.report_pipeline_for(project)
+        return steps, "built-in", note
+    steps = project_actions.builtin_steps(name)
+    if steps is None:
+        return None, "", None
+    return steps, "built-in", None

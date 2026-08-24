@@ -127,6 +127,52 @@ def load_defined_plots(path: Union[str, Path]) -> list[tuple[str, list[str]]]:
         return []
 
 
+def validate_dlife_workbook(path: Union[str, Path]) -> list[str]:
+    """Problems that stop *path* being read as a DLife workbook; empty = fine.
+
+    Header-only reads: this runs before a file is adopted into a Project, so
+    it must be cheap and must never load a whole census.
+    """
+    p = Path(path)
+    if not p.is_file():
+        return [f"{p.name}: not a file."]
+    if p.suffix.lower() != ".xlsx":
+        return [f"{p.name}: not an .xlsx workbook."]
+    try:
+        import openpyxl
+
+        book = openpyxl.load_workbook(p, read_only=True, data_only=True)
+        sheets = set(book.sheetnames)
+        book.close()
+    except Exception as exc:  # noqa: BLE001 - any openpyxl failure is the answer
+        return [f"{p.name}: cannot be opened as an Excel workbook ({exc})."]
+
+    problems = [f"{p.name}: no {sheet!r} sheet." for sheet in ("Design", "RawData")
+                if sheet not in sheets]
+    if problems:
+        return problems
+
+    try:
+        design = list(pd.read_excel(p, sheet_name="Design", nrows=0).columns)
+        raw = set(pd.read_excel(p, sheet_name="RawData", nrows=0).columns)
+    except Exception as exc:  # noqa: BLE001
+        return [f"{p.name}: sheets could not be read ({exc})."]
+
+    for column in ("Chamber", "SampleSize"):
+        if column not in design:
+            problems.append(f"{p.name}: Design sheet has no {column!r} column.")
+    if "StartTime" not in design:
+        problems.append(f"{p.name}: Design sheet has no 'StartTime' column.")
+    elif not design[design.index("StartTime") + 1:]:
+        problems.append(f"{p.name}: Design sheet has no treatment factor "
+                        f"columns after 'StartTime'.")
+    missing = {"AgeH", "Chamber", "IntDeaths", "Censored"} - raw
+    if missing:
+        problems.append(f"{p.name}: RawData sheet is missing "
+                        f"{', '.join(sorted(missing))}.")
+    return problems
+
+
 def load_design(path: Union[str, Path]) -> tuple[pd.DataFrame, list[str]]:
     """Read the Design sheet and return (design_df, factor_names).
 

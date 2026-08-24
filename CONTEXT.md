@@ -35,7 +35,10 @@ implies pooling)
 **Member Experiment**:
 An Experiment that belongs to a Project — analyzed entirely on its own,
 related to its siblings by the *question* they address rather than by an
-identical design.
+identical design. One arrives three ways (ADR-0008): an existing directory
+adopted (copied in unless it is already a child), an empty one scaffolded, or
+one built around a single DLife workbook (moved in if it was already loose in
+the Project tree, copied otherwise).
 _Avoid_: replicate (implies same-design repeats and pooling — the very thing
 this app does not do), arm, variant
 
@@ -160,10 +163,21 @@ The only bridge down is `run_in_experiments`, which runs a named Experiment
 Script in every Member Experiment (or just those named in its `only:` list),
 continue-on-error.
 
+**`batch` script**:
+The Project Script every `project.yaml` is created with (ADR-0007), named for
+what it is: the one a Batch Run executes in this Project unless another is
+designated. Written into the file rather than kept in code, so it is visible,
+editable and renameable. A Project whose `scripts:` is empty does not run.
+_Avoid_: default script (says nothing about when it runs)
+
 **Batch Run**:
 One execution of a designated Project Script in every Project under a Batch,
 continue-on-error with per-Project log prefixes. `batch.yaml` holds that
-designation and a central `project_scripts:` section.
+designation and a central `project_scripts:` section. **No designation means
+each Project runs its own `batch` script** — resolution for a named one is
+central `project_scripts:`, then the Project's own `scripts:`, then the
+built-ins; a name that resolves nowhere fails that Project, and the run
+continues.
 
 **Project Report**:
 `<project>/<project>_report.pdf`: a cover carrying the project's question, a

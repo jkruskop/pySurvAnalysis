@@ -1,0 +1,17 @@
+name: TestProject
+question: Whether dilps block crowding effects on lifespan.
+defaults:
+  experiment_type: standard_lifespan
+  global:
+    time_unit: days
+    time_label: Age (days)
+    assume_censored: true
+    min_n_per_chamber: 5
+scripts:
+- name: Report pipeline
+  steps:
+  - action: run_in_experiments
+    script: Standard analysis
+  - action: render_publication_figures
+  - action: project_report
+experiment_scripts: []

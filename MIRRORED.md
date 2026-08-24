@@ -11,7 +11,8 @@ This file makes it visible. Each row records what was copied, from where, and
 at which upstream commit, so a future extraction into a shared package is
 mechanical rather than archaeological.
 
-**Upstream baseline:** `PyTrackingAnalysis@5499e8a` (2026-08-22)
+**Upstream baseline:** `PyTrackingAnalysis@5499e8a` (2026-08-22). The
+`batch`-script rules (ADR-0007) were re-checked against `@4008526`.
 
 | File here | Upstream path | Relationship |
 |---|---|---|
@@ -29,6 +30,7 @@ mechanical rather than archaeological.
 | `pysurvanalysis/apps/plot_editor.py` | `pytrackinganalysis/apps/plot_editor.py` | **structure ported** — same Spec/Style editing model, experiment-level (ADR-0005) |
 | `pysurvanalysis/pubfigures.py` | `pytrackinganalysis/pubfigures.py` | **reimplemented** on the same Spec/Style contract for survivorship curves + the At-Risk Band (ADR-0004) |
 | `pysurvanalysis/script_editor/project_actions.py` | `pytrackinganalysis/script_editor/project_actions.py` | **reimplemented**; no pooling actions, adds the type-registry hard error |
+| `pysurvanalysis/domain/batch.py` | `pytrackinganalysis/batch.py` | **reimplemented** on the same contract — structural Batch, lazy `batch.yaml`, `resolve_designated_script` central→own→built-in, no implicit fallback (ADR-0007) |
 
 ## Not mirrored — deliberate divergences
 

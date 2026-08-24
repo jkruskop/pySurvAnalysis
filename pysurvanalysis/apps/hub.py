@@ -50,6 +50,7 @@ from ..domain import (
     upgrade as upgrade_mod,
 )
 from ..experiment_types import available_types
+from ..script_editor.project_actions import DEFAULT_PROJECT_SCRIPT_NAME
 from ..ui import (
     ActionButton,
     Card,
@@ -71,13 +72,18 @@ PANEL_WIDTH = 540
 TILES = (
     ("batch", "Batch", "batch", Category.NEUTRAL),
     ("project", "Project", "project", Category.NEUTRAL),
-    ("analyze", "Analyze", "analyze", Category.ANALYZE),
     ("qc", "QC", "qc", Category.QC),
+    ("analyze", "Analyze", "analyze", Category.ANALYZE),
     ("plots", "Plots", "plots", Category.PLOTS),
     ("scripts", "Scripts", "scripts", Category.SCRIPTS),
     ("ai", "AI", "ai", Category.AI),
     ("tools", "Tools", "tools", Category.TOOLS),
 )
+
+
+#: The Batch picker's leading entry — designates nothing (see ADR: no
+#: designation means each Project runs its own default script).
+BATCH_OWN_SCRIPT_ITEM = f"Each project's own {DEFAULT_PROJECT_SCRIPT_NAME!r} script (default)"
 
 
 class HubWindow(QMainWindow):
@@ -99,14 +105,18 @@ class HubWindow(QMainWindow):
 
         self._build_ui()
         self._click_away = ClickAwayFilter(self)
-        QApplication.instance().installEventFilter(self._click_away)
+        app = QApplication.instance()
+        app.installEventFilter(self._click_away)
+        ## Belt to closeEvent's braces: catch quit paths that never close
+        ## the window (see _detach_click_away).
+        app.aboutToQuit.connect(self._detach_click_away)
 
+        ## Nothing is selected on launch unless a path was named on the
+        ## command line: the Hub opens on no subject, and the user picks one
+        ## (Open project…, or Recent). Restoring the last project silently
+        ## re-opened work the user may have finished with.
         if initial_path:
             self._set_selection(initial_path)
-        else:
-            recent = ui_settings.get("recent_projects", []) or []
-            if recent:
-                self._set_selection(recent[0])
         self._refresh_all()
 
     # ── construction ───────────────────────────────────────────────────────
@@ -119,14 +129,14 @@ class HubWindow(QMainWindow):
         outer.setSpacing(8)
 
         self._topbar = TopBar("pySurvAnalysis")
-        open_btn = QPushButton(icon("open"), " Open…")
-        open_btn.clicked.connect(self._pick_directory)
+        ## Opening lives in the Project card, where the work starts; the top
+        ## bar keeps only Recent and the theme toggle.
         recent_btn = QPushButton(icon("menu"), " Recent")
         recent_btn.clicked.connect(self._show_recent_menu)
         theme_btn = QPushButton(icon("theme_dark"), "")
         theme_btn.setToolTip("Toggle light/dark theme")
         theme_btn.clicked.connect(self._toggle_theme)
-        for btn in (open_btn, recent_btn, theme_btn):
+        for btn in (recent_btn, theme_btn):
             self._topbar.add_right(btn)
         outer.addWidget(self._topbar)
 
@@ -143,6 +153,7 @@ class HubWindow(QMainWindow):
         self._status_panel = StatusPanel()
         strip_lay.addWidget(self._status_panel, 1)
         outer.addWidget(strip)
+        self._strip = strip
 
         # The log is the dock's first tab; figures open beside it.
         self._log = OutputLog()
@@ -158,8 +169,8 @@ class HubWindow(QMainWindow):
     def _build_panels(self) -> None:
         self._build_batch_panel()
         self._build_project_panel()
-        self._build_analyze_panel()
         self._build_qc_panel()
+        self._build_analyze_panel()
         self._build_plots_panel()
         self._build_scripts_panel()
         self._build_ai_panel()
@@ -190,38 +201,62 @@ class HubWindow(QMainWindow):
     def _build_project_panel(self) -> None:
         card = Card("Project", Category.NEUTRAL, icon_name="project",
                     subtitle="Double-click a member to load it.")
+        ## Open and Create lead the card: opening or making a Project is the
+        ## first thing anyone does here, so they sit above the members grid.
+        row = QHBoxLayout()
+        open_btn = QPushButton(icon("open"), " Open project…")
+        open_btn.clicked.connect(self._pick_directory)
+        create = QPushButton(icon("new"), " Create project…")
+        create.clicked.connect(self._action_create_project)
+        row.addWidget(open_btn)
+        row.addWidget(create)
+        card.add_body(row)
+
         self._members_table = self._make_table(
             ["Member", "Type", "N", "Analysed", "Exclusions"])
         self._members_table.doubleClicked.connect(self._on_member_double_clicked)
         card.add_body(self._members_table)
 
+        ## Three ways in, because members arrive three ways: an existing
+        ## experiment folder, an empty one to fill, or a bare workbook.
         row = QHBoxLayout()
-        add = QPushButton(icon("add"), " Add member…")
-        add.clicked.connect(self._action_add_member)
-        create = QPushButton(icon("new"), " Create project…")
-        create.clicked.connect(self._action_create_project)
-        row.addWidget(add)
-        row.addWidget(create)
+        adopt_dir = QPushButton(icon("open"), " Add directory…")
+        adopt_dir.setToolTip("Take an existing experiment directory (with a "
+                             "data/ folder) into this Project.")
+        adopt_dir.clicked.connect(self._action_add_directory)
+        create_dir = QPushButton(icon("add"), " Create directory…")
+        create_dir.setToolTip("Scaffold an empty member: a data/ folder and a "
+                              "default config from the Project's type.")
+        create_dir.clicked.connect(self._action_add_member)
+        adopt_file = QPushButton(icon("excel"), " Add experiment…")
+        adopt_file.setToolTip("Build a member around one DLife workbook.")
+        adopt_file.clicked.connect(self._action_add_experiment)
+        for btn in (adopt_dir, create_dir, adopt_file):
+            row.addWidget(btn)
         card.add_body(row)
         self._panels["project"].add_card(card)
 
-        run_card = Card("Project actions", Category.ANALYZE, icon_name="report")
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Script:"))
-        self._project_script = QComboBox()
-        row.addWidget(self._project_script, 1)
-        run_card.add_body(row)
-        run_btn = ActionButton("Run project script", Category.ANALYZE, icon_name="play")
-        run_btn.clicked.connect(self._action_run_project_script)
-        run_card.add_body(run_btn)
+        actions_card = Card("Actions", Category.ANALYZE, icon_name="report")
         report_btn = ActionButton("Project report", Category.ANALYZE, icon_name="report")
         report_btn.clicked.connect(self._action_project_report)
-        run_card.add_body(report_btn)
+        actions_card.add_body(report_btn)
         validate_btn = ActionButton("Validate project", Category.TOOLS,
                                     icon_name="validate")
         validate_btn.clicked.connect(self._action_validate_project)
-        run_card.add_body(validate_btn)
-        self._panels["project"].add_card(run_card)
+        actions_card.add_body(validate_btn)
+        self._panels["project"].add_card(actions_card)
+
+        scripts_card = Card("Scripts", Category.SCRIPTS, icon_name="scripts",
+                            subtitle="The Project's own scripts first, then "
+                                     "the built-ins.")
+        row = QHBoxLayout()
+        self._project_script = QComboBox()
+        row.addWidget(self._project_script, 1)
+        run_btn = ActionButton("Run script", Category.SCRIPTS, icon_name="play")
+        run_btn.clicked.connect(self._action_run_project_script)
+        row.addWidget(run_btn)
+        scripts_card.add_body(row)
+        self._panels["project"].add_card(scripts_card)
 
     def _build_analyze_panel(self) -> None:
         self._analyze_card = Card(
@@ -252,6 +287,15 @@ class HubWindow(QMainWindow):
         self._panels["qc"].add_card(card)
 
     def _build_plots_panel(self) -> None:
+        ## Plot-producing actions live here, not under Analyze: an Action
+        ## already declares its category, and a plot is a plot wherever the
+        ## Experiment Type contributed it from.
+        self._plot_actions_card = Card(
+            "Plots", Category.PLOTS, icon_name="plot",
+            subtitle="Buttons here are contributed by the loaded experiment's "
+                     "Experiment Type.")
+        self._panels["plots"].add_card(self._plot_actions_card)
+
         card = Card("Publication figures", Category.PLOTS, icon_name="figures",
                     subtitle="Vector figures from plot_specs.yaml — styles come "
                              "from the Project, specs from the experiment.")
@@ -358,10 +402,56 @@ class HubWindow(QMainWindow):
         self._tiles[self._open_panel].set_active(False)
         self._open_panel = None
 
+    def _handle_click_away(self, event) -> None:
+        """Close the open panel when a press lands outside it.
+
+        Called by :class:`ClickAwayFilter` on GUI-thread mouse presses only.
+        The click itself is never swallowed. Presses on the tile strip are
+        ignored so a tile's own toggle still sees the panel as open (and
+        therefore closes it) rather than re-opening it.
+        """
+        if self._open_panel is None:
+            return
+        panel = self._panels.get(self._open_panel)
+        if panel is None or not panel.isVisible():
+            return
+        probe = QApplication.widgetAt(event.globalPosition().toPoint())
+        while probe is not None:
+            if probe is panel or probe is self._strip:
+                return
+            probe = probe.parentWidget()
+        self.close_panel()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        super().resizeEvent(event)
+        ## Keep an open panel anchored under its tile when the window resizes.
+        ## getattr: a resize can arrive before __init__ finishes building.
+        key = getattr(self, "_open_panel", None)
+        if key is not None:
+            self._open_panel = None
+            self._toggle_panel(key)
+
     def keyPressEvent(self, event) -> None:  # noqa: N802 (Qt override)
         if event.key() == Qt.Key.Key_Escape:
             self.close_panel()
         super().keyPressEvent(event)
+
+    def _detach_click_away(self) -> None:
+        """Uninstall the app-level filter.
+
+        Left installed it outlives the widgets it forwards to, and Qt still
+        routes shutdown events through it once a panel has been shown —
+        observed as a segfault on quit.
+        """
+        app = QApplication.instance()
+        if app is not None and self._click_away is not None:
+            app.removeEventFilter(self._click_away)
+        self._click_away = None
+
+    def closeEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        self.close_panel()
+        self._detach_click_away()
+        super().closeEvent(event)
 
     # ── selection ──────────────────────────────────────────────────────────
 
@@ -443,7 +533,7 @@ class HubWindow(QMainWindow):
 
     def _refresh_all(self) -> None:
         self._refresh_tables()
-        self._refresh_analyze_panel()
+        self._refresh_action_panels()
         self._refresh_scripts()
         self._refresh_exclusion_groups()
         self._refresh_ai()
@@ -467,6 +557,12 @@ class HubWindow(QMainWindow):
         elif self._experiment is not None:
             self._tiles["project"].set_summary(
                 ["standalone experiment", self._experiment.name])
+            self._tiles["project"].set_dimmed(True)
+        elif self._selection is None:
+            ## Nothing is selected on launch, so the tile has to say where the
+            ## way in is now that the top bar has no Open button.
+            self._tiles["project"].set_summary(
+                ["nothing selected", "click here ▸ Open project…"])
             self._tiles["project"].set_dimmed(True)
         else:
             self._tiles["project"].set_summary(
@@ -535,8 +631,12 @@ class HubWindow(QMainWindow):
             self._batch_script.clear()
             from ..script_editor import project_actions
 
-            names = project_actions.builtin_names()
-            names += [s["name"] for s in self._batch.project_scripts()]
+            ## The leading entry designates nothing: each Project runs its own
+            ## 'batch' script. It stays first so a Batch needs no batch.yaml
+            ## until someone deliberately designates one script for all.
+            self._batch_script.addItem(BATCH_OWN_SCRIPT_ITEM)
+            names = [s["name"] for s in self._batch.project_scripts()]
+            names += [n for n in project_actions.builtin_names() if n not in names]
             self._batch_script.addItems(names)
             if self._batch.designated_script:
                 idx = self._batch_script.findText(self._batch.designated_script)
@@ -568,17 +668,25 @@ class HubWindow(QMainWindow):
         for col, value in enumerate(values):
             table.setItem(row, col, QTableWidgetItem(str(value)))
 
-    def _refresh_analyze_panel(self) -> None:
-        """Rebuild the Analyze buttons from ``core ∪ type`` (ADR-0002)."""
-        layout = self._analyze_card.body_layout()
-        while layout.count():
-            item = layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.setParent(None)
+    def _refresh_action_panels(self) -> None:
+        """Rebuild the contributed buttons from ``core ∪ type`` (ADR-0002).
+
+        One registry, split by the category each Action already declares:
+        plot-producing actions go to the Plots card, beside Render figures;
+        everything else stays on Analyze.
+        """
+        analyze = self._analyze_card.body_layout()
+        plots = self._plot_actions_card.body_layout()
+        for layout in (analyze, plots):
+            while layout.count():
+                item = layout.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.setParent(None)
 
         if self._experiment is None:
-            layout.addWidget(QLabel("Load an experiment to see its actions."))
+            analyze.addWidget(QLabel("Load an experiment to see its actions."))
+            plots.addWidget(QLabel("Load an experiment to see its plots."))
             return
 
         from ..script_editor import actions as action_mod
@@ -592,7 +700,8 @@ class HubWindow(QMainWindow):
                                icon_name=action.icon_name)
             btn.setToolTip(action.description)
             btn.clicked.connect(lambda _c, k=key: self._run_action(k))
-            layout.addWidget(btn)
+            target = plots if action.category is Category.PLOTS else analyze
+            target.addWidget(btn)
 
     def _refresh_scripts(self) -> None:
         self._scripts_combo.clear()
@@ -692,24 +801,29 @@ class HubWindow(QMainWindow):
             self._warn("Select a directory that holds Projects first.")
             return
         batch, name = self._batch, self._batch_script.currentText()
-        self._spawn(f"Batch run: {name}",
+        if name == BATCH_OWN_SCRIPT_ITEM:
+            name = None                       # no designation: each its own
+        label = name or f"each project's own {DEFAULT_PROJECT_SCRIPT_NAME!r} script"
+        self._spawn(f"Batch run: {label}",
                     lambda: batch.run(name, log=print).summary())
 
     def _action_run_project_script(self) -> None:
         if self._project is None:
             self._warn("No Project selected.")
             return
+        from ..domain.batch import resolve_designated_script
         from ..script_editor import project_actions
 
         project, name = self._project, self._project_script.currentText()
-        steps = None
-        for script in project.scripts():
-            if script.get("name") == name:
-                steps = list(script.get("steps") or [])
-        steps = steps if steps is not None else project_actions.builtin_steps(name)
+        ## Same resolver a Batch Run uses — no central scripts here, so it
+        ## reads the Project's own first, then the built-ins, and reports a
+        ## conditionally dropped step the same way.
+        steps, _source, note = resolve_designated_script(name, [], project)
         if steps is None:
             self._warn(f"No Project Script named {name!r}.")
             return
+        if note:
+            self._log.append_line(f"! {note}")
 
         def _job():
             project_actions.run_script(project, steps, log=print)
@@ -761,6 +875,46 @@ class HubWindow(QMainWindow):
         member = self._project.add_member(name)
         self._log.append_line(f"Scaffolded {member.directory} from the Project defaults. "
                          f"Put its data file in {member.data_dir}.")
+        self._refresh_all()
+
+    def _action_add_directory(self) -> None:
+        if self._project is None:
+            self._warn("Create or select a Project first.")
+            return
+        path = QFileDialog.getExistingDirectory(
+            self, "Add an existing experiment directory", str(self._project.directory))
+        if not path:
+            return
+        try:
+            member = self._project.adopt_directory(path)
+        except (ProjectError, OSError) as exc:
+            self._warn(str(exc))
+            return
+        moved = "" if Path(path).resolve() == member.directory else \
+            f" (copied from {Path(path).resolve()})"
+        self._log.append_line(f"Added member {member.name}{moved}.")
+        self._refresh_all()
+
+    def _action_add_experiment(self) -> None:
+        if self._project is None:
+            self._warn("Create or select a Project first.")
+            return
+        path, _filter = QFileDialog.getOpenFileName(
+            self, "Add a DLife survival workbook", str(self._project.directory),
+            "DLife workbook (*.xlsx)")
+        if not path:
+            return
+        source = Path(path).resolve()
+        inside = self._project.directory in source.parents
+        try:
+            member = self._project.adopt_data_file(source)
+        except (ProjectError, OSError) as exc:
+            self._warn(str(exc))
+            return
+        verb = "moved" if inside else "copied"
+        self._log.append_line(
+            f"Added member {member.name}: {verb} {source.name} into "
+            f"{member.data_dir}.")
         self._refresh_all()
 
     def _action_create_project(self) -> None:

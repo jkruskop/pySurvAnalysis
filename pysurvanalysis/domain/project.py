@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Iterator
 
 from . import config as cfgmod
-from .experiment import SurvivalExperiment
+from .experiment import SurvivalExperiment, is_data_file
 
 
 class ProjectError(RuntimeError):
@@ -253,6 +253,13 @@ class Project:
         return cfgmod.scripts_of(self.config, "experiment_scripts")
 
     def save(self) -> Path:
+        ## A file with no `scripts:` key at all predates the seeded default
+        ## (or was hand-written): give it one on the next write so every
+        ## Project ships a visible, editable run. An existing block is never
+        ## touched — an empty list is a deliberate deletion, and re-seeding it
+        ## would undo the user's edit.
+        if "scripts" not in self.config:
+            self.config["scripts"] = [default_project_script()]
         return cfgmod.write_yaml(self.config_path, self.config)
 
     # ── creation ───────────────────────────────────────────────────────────
@@ -279,11 +286,137 @@ class Project:
             "name": name or d.name,
             "question": question,
             "defaults": seed,
-            "scripts": [DEFAULT_PROJECT_SCRIPT],
+            "scripts": [default_project_script()],
             "experiment_scripts": [],
         }
         cfgmod.write_yaml(path, body)
         return Project(d)
+
+    def adopt_directory(self, source: str | Path) -> SurvivalExperiment:
+        """Take an existing experiment directory into this Project.
+
+        *source* must hold a ``data/`` subdirectory with a DLife workbook in
+        it. A directory that is not already a direct child of the Project is
+        **copied** in — the Project owns its members, and analysing a folder
+        that lives somewhere else would write outputs outside the Project.
+        A directory with no ``survival_config.yaml`` gets a default one from
+        the Project's Experiment Type.
+        """
+        import shutil
+
+        from .. import data_loader
+
+        src = Path(source).expanduser().resolve()
+        if not src.is_dir():
+            raise ProjectError(f"{src} is not a directory.")
+        if src == self.directory:
+            raise ProjectError("That is the Project directory itself.")
+        if src in self.directory.parents:
+            ## Copying an ancestor of the Project into the Project would copy
+            ## the Project into itself.
+            raise ProjectError(f"{src} contains this Project.")
+        if is_project_dir(src):
+            raise ProjectError(f"{src.name} is a Project, not an experiment "
+                               f"directory.")
+
+        data_dir = src / "data"
+        if not data_dir.is_dir():
+            raise ProjectError(f"{src.name} has no data/ subdirectory.")
+        candidates = [p for p in sorted(data_dir.iterdir()) if is_data_file(p)]
+        workbooks = [p for p in candidates if p.suffix.lower() == ".xlsx"]
+        if not workbooks:
+            raise ProjectError(f"No .xlsx file in {src.name}/data.")
+
+        chosen, problems = None, []
+        for book in workbooks:
+            found = data_loader.validate_dlife_workbook(book)
+            if not found:
+                chosen = book
+                break
+            problems = problems or found
+        if chosen is None:
+            raise ProjectError("; ".join(problems))
+
+        if src.parent == self.directory:
+            dest = src                       # already a member's home: adopt in place
+        else:
+            dest = self.directory / src.name
+            if dest.exists():
+                raise ProjectError(f"{dest} already exists.")
+            shutil.copytree(src, dest)
+
+        if not cfgmod.is_experiment_dir(dest):
+            config = self._member_config_for(dest / "data" / chosen.name)
+            if len(candidates) > 1:
+                ## More than one data file: name the one that was validated,
+                ## or loading the member is ambiguous.
+                config["data_file"] = f"data/{chosen.name}"
+            cfgmod.save_config(dest, config)
+        self._members = None
+        return SurvivalExperiment(dest, defaults=self.defaults, project=self)
+
+    def adopt_data_file(self, source: str | Path, *,
+                        name: str | None = None) -> SurvivalExperiment:
+        """Scaffold a Member Experiment around one DLife workbook.
+
+        The member is named after the file (``cohort_a.xlsx`` →
+        ``cohort_a/``), the file lands in its ``data/``, and a default config
+        comes from the Project's Experiment Type. A file already inside the
+        Project is **moved** rather than copied — it was loose in the tree,
+        and leaving a copy behind would make the Project ambiguous about which
+        one is the member's data.
+        """
+        import shutil
+
+        from .. import data_loader
+
+        src = Path(source).expanduser().resolve()
+        problems = data_loader.validate_dlife_workbook(src)
+        if problems:
+            raise ProjectError("; ".join(problems))
+
+        member_name = (name or src.stem).strip()
+        if not member_name:
+            raise ProjectError(f"{src.name} has no usable base name.")
+        dest = self.directory / member_name
+        target = dest / "data" / src.name
+        inside = self.directory in src.parents
+
+        if target.exists() and target.samefile(src):
+            pass                              # already where it belongs
+        elif dest.exists():
+            raise ProjectError(f"{dest} already exists.")
+        else:
+            target.parent.mkdir(parents=True)
+            if inside:
+                shutil.move(str(src), str(target))
+            else:
+                shutil.copy2(src, target)
+
+        if not cfgmod.is_experiment_dir(dest):
+            cfgmod.save_config(dest, self._member_config_for(target))
+        self._members = None
+        return SurvivalExperiment(dest, defaults=self.defaults, project=self)
+
+    def _member_config_for(self, data_file: Path) -> dict:
+        """A config for a member built around *data_file*.
+
+        Minimal on purpose (as in :meth:`add_member`) — everything the
+        Project's ``defaults:`` supplies is inherited — plus the two things
+        only the file itself can say: how to read it, and whether its
+        PrivateData sheet turns off assumed censoring.
+        """
+        from . import upgrade as upgrade_mod
+
+        config = self.type.scaffold_config(minimal=True)
+        sniffed = upgrade_mod.sniff_config(data_file, self.type_key)
+        if sniffed.get("input"):
+            config["input"] = sniffed["input"]
+        assume = (sniffed.get("global") or {}).get("assume_censored")
+        inherited = (self.defaults.get("global") or {}).get("assume_censored", True)
+        if assume is not None and bool(assume) != bool(inherited):
+            config.setdefault("global", {})["assume_censored"] = bool(assume)
+        return config
 
     def add_member(self, name: str, *, config: dict | None = None) -> SurvivalExperiment:
         """Scaffold a new Member Experiment from the Project Defaults."""
@@ -308,11 +441,10 @@ class Project:
 
 #: Written into every new ``project.yaml``. A Batch Run executes this copy by
 #: default, so zero authoring already means "report on every Project".
-DEFAULT_PROJECT_SCRIPT = {
-    "name": "Report pipeline",
-    "steps": [
-        {"action": "run_in_experiments", "script": "Standard analysis"},
-        {"action": "render_publication_figures"},
-        {"action": "project_report"},
-    ],
-}
+def default_project_script() -> dict:
+    """The Project Script a new ``project.yaml`` is seeded with — the
+    ``batch`` script a Batch Run executes here (see
+    :mod:`pysurvanalysis.script_editor.project_actions`)."""
+    from ..script_editor.project_actions import default_project_script as seed
+
+    return seed()
