@@ -11,16 +11,61 @@ with one deliberate divergence: **Projects here never pool.**
 ## Language
 
 **Batch**:
-A directory whose immediate subdirectories holding a `project.yaml` are its
-Projects. Purely a processing convenience for running many Projects
-unattended; it holds no analysis of its own and never combines results.
+A directory with at least one Project anywhere beneath it. Discovery is
+**recursive and prunes at each Project** (ADR-0009): the walk descends until
+it finds a Project — `project.yaml` plus at least one Member Experiment — and
+never looks inside one, because a Project's subdirectories are its members by
+definition. Projects therefore need not be immediate children, and grouping
+folders (`Sept2026/`, `Archive/2025/`) are transparent. Purely a processing
+convenience for running many Projects unattended; it holds no analysis of its
+own and never combines results. A Batch may contain Batches — whichever is
+selected is the one that runs, and a nested `batch.yaml` is named in the log
+and ignored.
 _Avoid_: study, collection, batch root
+
+**Batch Project**:
+One Project a Batch Run can target, identified by its **key** — its POSIX path
+relative to the Batch root (`Sept2026/ProjA`; a top-level Project is just
+`ProjA`, so every `batch.yaml` written before discovery went recursive still
+resolves). Deliberately *not* called a member: at this level "member" would
+collide with **Member Experiment** one level down, and "a member with four
+members" is a sentence this codebase must not be able to write. It is the word
+the sister app uses for the same thing; the collision is why we diverge.
+_Avoid_: member, batch member, replicate
+
+**Blocked Member**:
+A Member Experiment a run cannot use as it stands: a directory holding data
+with no `survival_config.yaml`, a config with no data file, or an **ambiguous**
+one holding several candidate files where the loader refuses to guess. Each
+reason names its own fix — scaffold the config, supply the data, or name one
+with `data_file:`. Blocked is a property of the Member Experiment, never of
+the Project: a Project with four healthy members and one blocked member runs
+the four. Blocked members are named before a Batch Run starts and again in its
+summary — being reported is the whole point, and a run is never refused
+because of one (a stale folder must not stop ten Projects at 2am). There is no
+"unfiled" state here: the loader searches `data/` **and** the directory root,
+so a file at either is already found (ADR-0009 diverging from the sister app,
+whose loader reads `data/` alone and which therefore also *files* recordings).
+_Avoid_: invalid member, broken member (nothing is broken — the run just
+cannot use it yet), unfiled
+
+**Batch Preflight**:
+The modal a Batch Run always opens first: the discovered Projects with their
+keys, usable-member counts and blocked members, each blocked member offering
+the action that clears it, then Run or Cancel. Shown even when nothing is
+wrong, because with recursive discovery the folder you picked no longer says
+what will run, and that target list is the one thing no other surface states.
+Unchecking a Project means "do not touch this one"; a Project repaired inside
+the preflight joins the run, since the repair is what made it runnable.
+_Avoid_: batch dialog, confirmation
 
 **Project**:
 A directory with a `project.yaml` at its root whose immediate subdirectories
 holding a `survival_config.yaml` are its **Member Experiments** — a set of
 independently analyzed experiments addressing one question in slightly
-different ways. A Project never pools its members.
+different ways. A Project never pools its members. A Project is never also a
+Batch: its subdirectories are its members, so a `project.yaml` nested inside
+one does not make a second Project (ADR-0009).
 _Avoid_: batch parent, parent directory
 
 **Project Defaults**:
@@ -171,13 +216,15 @@ editable and renameable. A Project whose `scripts:` is empty does not run.
 _Avoid_: default script (says nothing about when it runs)
 
 **Batch Run**:
-One execution of a designated Project Script in every Project under a Batch,
-continue-on-error with per-Project log prefixes. `batch.yaml` holds that
-designation and a central `project_scripts:` section. **No designation means
-each Project runs its own `batch` script** — resolution for a named one is
-central `project_scripts:`, then the Project's own `scripts:`, then the
-built-ins; a name that resolves nowhere fails that Project, and the run
-continues.
+One execution of a designated Project Script in every **checked** Project of a
+Batch, continue-on-error with per-Project log prefixes. The checked set is
+confirmed in the **Batch Preflight** and nothing outside it is touched.
+`batch.yaml` holds the designation and a central `project_scripts:` section.
+**No designation means each Project runs its own `batch` script** — resolution
+for a named one is central `project_scripts:`, then the Project's own
+`scripts:`, then the built-ins; a name that resolves nowhere fails that
+Project, and the run continues. The summary carries a usable/total member
+ratio per Project, so "succeeded" cannot be read as "analysed everything".
 
 **Project Report**:
 `<project>/<project>_report.pdf`: a cover carrying the project's question, a
@@ -248,9 +295,13 @@ _Avoid_: template config, full config
 
 ## Relationships
 
-- A **Batch** contains many **Projects**; a **Project** contains many
-  **Member Experiments**; each Member Experiment is an **Experiment Directory**.
+- A **Batch** contains many **Projects**, at any depth; a **Project** contains
+  many **Member Experiments**; each Member Experiment is an **Experiment
+  Directory**. As a Batch Run target a Project is a **Batch Project**, named by
+  its key.
 - An Experiment Directory may also stand alone, with no Project above it.
+- A **Blocked Member** belongs to the Member Experiment level, so a Project is
+  never blocked — it just has fewer members the run can use.
 - Every Member Experiment of a Project shares that Project's **Experiment
   Type** — the only value validated across members.
 - An **Experiment Type** owns a **Plot Set** (one of whose figures is the
@@ -273,6 +324,12 @@ _Avoid_: template config, full config
 > Experiment** and the other's a **Standard Lifespan**, there's no coherent
 > Plot Set or Analyze panel to offer, so that's an error. Everything else in
 > `defaults:` is a starting point, not a rule."
+> **Dev:** "One folder in there has the workbook but nobody wrote it a config.
+> Does that fail the Project?"
+> **Domain expert:** "No — that's a **Blocked Member**. The Project runs the
+> members it can and the run tells me which one it skipped, before it starts
+> and again at the end. If it refused the whole Project I'd lose a night's
+> analysis over one folder somebody forgot."
 
 ## Flagged ambiguities
 
@@ -288,3 +345,6 @@ _Avoid_: template config, full config
 - "Load" named both an input-format dialog and the act of making an
   experiment current — resolved: format is configuration
   (`survival_config.yaml`), loading is a selection/double-click.
+- "Member" was about to name both a Batch's Projects (following the sister
+  app) and a Project's experiments — resolved: a Batch's children are **Batch
+  Projects**; "member" belongs to the Project→Experiment level alone.

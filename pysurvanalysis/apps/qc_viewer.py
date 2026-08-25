@@ -18,6 +18,12 @@ matplotlib.use("QtAgg")  # noqa: E402
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 
+from ..gui_env import sanitize_input_method_environment
+
+## Before Qt is imported, not after: the overrides are read when the
+## platform plugin initialises.
+sanitize_input_method_environment()
+
 from PyQt6.QtCore import QSize, Qt
 from PyQt6.QtWidgets import (
     QApplication,

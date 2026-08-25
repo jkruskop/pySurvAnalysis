@@ -18,6 +18,12 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
 
+from ..gui_env import sanitize_input_method_environment
+
+## Before Qt is imported, not after: the overrides are read when the
+## platform plugin initialises.
+sanitize_input_method_environment()
+
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QComboBox,

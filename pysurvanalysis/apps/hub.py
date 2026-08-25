@@ -11,6 +11,13 @@ Two things differ from the sister app by design:
 * the **Analyze** panel's buttons are contributed by the loaded experiment's
   Experiment Type, so a button and its script action are one declaration
   (ADR-0002).
+
+Batch discovery is recursive (ADR-0009), so the selection may name a folder
+several levels above the Projects. The walk is expensive next to the single
+``iterdir`` it replaced and every tile refresh reads it, so it is done once per
+selection and cached on the ``Batch``; **Rescan** re-runs it. A Batch Run is
+always confirmed in the preflight, because with recursion the folder the user
+picked no longer says what will run.
 """
 
 from __future__ import annotations
@@ -18,13 +25,22 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from ..gui_env import sanitize_input_method_environment
+
+## Before Qt is imported, not after: the overrides are read when the
+## platform plugin initialises.
+sanitize_input_method_environment()
+
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QAction
+from PyQt6.QtGui import QAction, QBrush
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -33,6 +49,7 @@ from PyQt6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -47,6 +64,7 @@ from ..domain import (
     config as cfgmod,
     is_experiment_dir,
     is_project_dir,
+    layout as layout_mod,
     upgrade as upgrade_mod,
 )
 from ..experiment_types import available_types
@@ -64,6 +82,7 @@ from ..ui import (
 )
 from ..ui import settings as ui_settings
 from ._hub_tiles import ClickAwayFilter, StatusPanel, StatusTile, TilePanel
+from .batch_preflight import BatchPreflightDialog, blocked_color
 from .common import TaskWorker
 
 PANEL_WIDTH = 540
@@ -182,20 +201,96 @@ class HubWindow(QMainWindow):
 
     def _build_batch_panel(self) -> None:
         card = Card("Batch run", Category.NEUTRAL, icon_name="batch",
-                    subtitle="Run one Project Script in every Project below "
-                             "this directory, continue-on-error.")
-        self._batch_table = self._make_table(["Project", "Type", "Members", "Report"])
+                    subtitle="Run one Project Script in every Project inside "
+                             "this folder, continue-on-error. Projects are "
+                             "found recursively, so they can sit at any depth.")
+        row = QHBoxLayout()
+        open_btn = QPushButton(icon("open"), " Choose batch folder…")
+        open_btn.setToolTip(
+            "Pick the folder that holds your Projects. They are found "
+            "recursively, so grouping folders (Sept2026/, Archive/2025/) are "
+            "transparent — every Project found is listed below for the run.")
+        open_btn.clicked.connect(self._pick_directory)
+        rescan = QPushButton(icon("refresh"), " Rescan")
+        rescan.setToolTip(
+            "Walk the batch folder again. The project list is read once when "
+            "the folder is selected; rescan after adding or fixing projects "
+            "outside the app.")
+        rescan.clicked.connect(self._action_rescan_batch)
+        self._btn_batch_rescan = rescan
+        row.addWidget(open_btn)
+        row.addWidget(rescan)
+        card.add_body(row)
+
+        self._batch_empty = QLabel(
+            "Choose a folder with Projects anywhere inside it, and every one "
+            "found is listed here for the run. A Project is a folder with a "
+            "project.yaml and at least one member experiment.")
+        self._batch_empty.setStyleSheet("color: palette(mid); font-style: italic;")
+        self._batch_empty.setWordWrap(True)
+        card.add_body(self._batch_empty)
+
+        self._batch_table = self._make_table(
+            ["Project", "Type", "Members", "Report", "Status"])
+        self._batch_table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self._batch_table.setToolTip(
+            "Checked Projects join the next Batch Run. A row's name is its "
+            "path inside the batch folder. Double-click to open that Project; "
+            "right-click for its blocked members.")
+        self._batch_table.doubleClicked.connect(self._on_batch_double_clicked)
+        ## Right-click, not double-click: double-click already means "open
+        ## this Project", so the repair menu takes the gesture that is free.
+        self._batch_table.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
+        self._batch_table.customContextMenuRequested.connect(self._batch_menu)
         card.add_body(self._batch_table)
+        hint = QLabel("Double-click a project to open its Project panel. "
+                      "Right-click to fix its blocked members.")
+        hint.setStyleSheet("color: palette(mid); font-style: italic;")
+        hint.setWordWrap(True)
+        card.add_body(hint)
 
         row = QHBoxLayout()
         row.addWidget(QLabel("Script:"))
         self._batch_script = QComboBox()
+        self._batch_script.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                         QSizePolicy.Policy.Fixed)
         row.addWidget(self._batch_script, 1)
         card.add_body(row)
 
         run = ActionButton("Run batch", Category.NEUTRAL, icon_name="play")
-        run.clicked.connect(self._action_run_batch)
+        run.setToolTip(
+            "Review the target list, then run the designated Project Script "
+            "in every checked Project — continue-on-error, per-Project "
+            "summary at the end.")
+        ## Through a lambda: clicked() would otherwise pass its bool into the
+        ## focus argument.
+        run.clicked.connect(lambda: self._action_run_batch())
         card.add_body(run)
+
+        ## A Batch Run touches every member of every Project, so the figure
+        ## tabs it would open run into the hundreds and bury the Output tab
+        ## the user is actually reading. Checked, new tabs stop being created;
+        ## the Output tab keeps streaming and every artefact is still written
+        ## to disk. On by default, and deliberately NOT gated on a Batch being
+        ## selected — it applies to every run.
+        self._chk_suppress_tabs = QCheckBox("Suppress new plot tabs")
+        self._chk_suppress_tabs.setToolTip(
+            "Stop opening a tab for every figure. The Output tab keeps "
+            "updating and every figure is still written to disk — only the "
+            "tabs are skipped. Applies to all runs while it is checked, not "
+            "just Batch Runs.")
+        self._chk_suppress_tabs.setChecked(True)
+        card.add_body(self._chk_suppress_tabs)
+
+        ## Everything that acts on a Batch is off until one is selected. The
+        ## suppress-tabs box is deliberately NOT in this list: it applies to
+        ## every run, so it stays usable with no Batch in hand.
+        self._batch_widgets = (self._batch_table, self._batch_script, run,
+                               rescan)
+        for widget in self._batch_widgets:
+            widget.setEnabled(False)
+        self._batch_card = card
         self._panels["batch"].add_card(card)
 
     def _build_project_panel(self) -> None:
@@ -236,26 +331,69 @@ class HubWindow(QMainWindow):
         card.add_body(row)
         self._panels["project"].add_card(card)
 
-        actions_card = Card("Actions", Category.ANALYZE, icon_name="report")
-        report_btn = ActionButton("Project report", Category.ANALYZE, icon_name="report")
+        actions_card = Card("Actions", Category.NEUTRAL, icon_name="report")
+        self._project_actions_card = actions_card
+        ## Every button here is NEUTRAL. They are all project actions, and
+        ## colouring each by the category of the work it happens to do made
+        ## one card read as a rainbow of unrelated things — the panel's
+        ## identity already comes from the tile above it. Category colour is
+        ## reserved for the panels where it distinguishes something: the
+        ## type-contributed Analyze and Plots buttons, and Tools.
+        ## Two rows of two: these are peers, and a stack of full-width
+        ## buttons made small actions look like the main event.
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
+        report_btn = ActionButton("Project report", Category.NEUTRAL,
+                                  icon_name="report")
+        report_btn.setToolTip(
+            "Bind one section per Member Experiment from each member's SAVED "
+            "outputs, behind the Member Inventory and the Divergence Note. A "
+            "member that has not been analysed yields a 'not analysed' "
+            "section rather than being silently analysed.")
         report_btn.clicked.connect(self._action_project_report)
-        actions_card.add_body(report_btn)
-        validate_btn = ActionButton("Validate project", Category.TOOLS,
+        view_btn = ActionButton("View reports", Category.NEUTRAL,
+                                icon_name="pdf")
+        view_btn.clicked.connect(self._action_view_reports)
+        self._btn_view_reports = view_btn
+        validate_btn = ActionButton("Validate YAMLs", Category.NEUTRAL,
                                     icon_name="validate")
+        validate_btn.setToolTip(
+            "Check the Project's project.yaml and every member's "
+            "survival_config.yaml — parse errors and semantic problems alike. "
+            "Validating only the loaded member left the rest of a Project "
+            "unchecked, which is exactly where a type mismatch hides.")
         validate_btn.clicked.connect(self._action_validate_project)
-        actions_card.add_body(validate_btn)
+        plots_btn = ActionButton("Plot editor…", Category.NEUTRAL,
+                                 icon_name="plot")
+        plots_btn.clicked.connect(self._action_open_plot_editor)
+        for i, btn in enumerate((report_btn, view_btn, validate_btn, plots_btn)):
+            grid.addWidget(btn, i // 2, i % 2)
+        for col in range(2):
+            grid.setColumnStretch(col, 1)
+        actions_card.add_body(grid)
         self._panels["project"].add_card(actions_card)
 
         scripts_card = Card("Scripts", Category.SCRIPTS, icon_name="scripts",
                             subtitle="The Project's own scripts first, then "
                                      "the built-ins.")
+        self._project_scripts_card = scripts_card
         row = QHBoxLayout()
         self._project_script = QComboBox()
+        self._project_script.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                           QSizePolicy.Policy.Fixed)
         row.addWidget(self._project_script, 1)
-        run_btn = ActionButton("Run script", Category.SCRIPTS, icon_name="play")
+        run_btn = ActionButton("Run script", Category.NEUTRAL, icon_name="play")
         run_btn.clicked.connect(self._action_run_project_script)
         row.addWidget(run_btn)
         scripts_card.add_body(row)
+        edit_btn = ActionButton("Edit scripts…", Category.NEUTRAL,
+                                icon_name="config")
+        edit_btn.setToolTip(
+            "Open the Script Editor on project.yaml — Project Scripts plus "
+            "the central experiment_scripts: one recipe serving every member.")
+        edit_btn.clicked.connect(self._action_open_script_editor)
+        scripts_card.add_body(edit_btn)
         self._panels["project"].add_card(scripts_card)
 
     def _build_analyze_panel(self) -> None:
@@ -387,11 +525,23 @@ class HubWindow(QMainWindow):
         if self._open_panel == key:
             self.close_panel()
             return
+        self._open_panel_for(key)
+
+    def _open_panel_for(self, key: str) -> None:
+        """Open *key*'s panel, whatever is open now.
+
+        Separate from :meth:`_toggle_panel` because some flows *move* the user
+        to a panel — double-clicking a Batch row lands them on Project, and a
+        finished load lands them on Analyze — and a toggle would close it
+        again whenever they were already there.
+        """
         self.close_panel()
         tile = self._tiles[key]
         panel = self._panels[key]
         top_left = tile.mapTo(self._central, tile.rect().bottomLeft())
-        panel.open_at(top_left.x(), top_left.y() + 4, self._central.height())
+        ## rect().bottom* coordinates are inclusive; +1 starts the panel just
+        ## below the strip while preserving the caller-owned bottom margin.
+        panel.open_at(top_left.x(), top_left.y() + 1, self._central.height() - 8)
         tile.set_active(True)
         self._open_panel = key
 
@@ -415,7 +565,13 @@ class HubWindow(QMainWindow):
         panel = self._panels.get(self._open_panel)
         if panel is None or not panel.isVisible():
             return
-        probe = QApplication.widgetAt(event.globalPosition().toPoint())
+        widget = QApplication.widgetAt(event.globalPosition().toPoint())
+        ## A press in another window (a dialog, the QC viewer, the Script
+        ## Editor) is not a click away from this panel — closing it there left
+        ## the user's place lost behind a dialog they were about to dismiss.
+        if widget is not None and widget.window() is not self:
+            return
+        probe = widget
         while probe is not None:
             if probe is panel or probe is self._strip:
                 return
@@ -507,11 +663,27 @@ class HubWindow(QMainWindow):
                                                   project=parent_project)
             self._log.append_line(f"Loaded standalone experiment {p.name} "
                              f"({self._experiment.type.label}).")
-        elif any(d.is_dir() and is_project_dir(d) for d in p.iterdir()):
-            self._batch = Batch(p)
+        else:
+            ## Recursive: Projects need not be immediate children, so a
+            ## grouping folder full of dated subfolders is a Batch too. The
+            ## walk is done once here and cached on the Batch.
+            candidate = Batch(p)
+            if candidate.batch_projects():
+                self._batch = candidate
 
         ui_settings.add_recent_project(str(p))
-        self._log.append_line(f"Selection: {p}")
+        kind = ("Batch" if self._batch is not None else
+                "Project" if self._project is not None else
+                "Experiment" if self._experiment is not None else "Directory")
+        self._log.append_line(f"{kind}: {p}")
+        if self._batch is not None:
+            for key, why in self._batch.skipped():
+                self._log.append_line(f"[batch] {key} skipped — {why}")
+            if self._batch.truncated:
+                self._log.append_line(
+                    f"[batch] the scan of {p} stopped early — this folder is "
+                    "larger than a batch should be, and projects deeper in it "
+                    "were not found. Choose one closer to the projects.")
 
     def _on_member_double_clicked(self, index) -> None:
         if self._project is None:
@@ -528,10 +700,22 @@ class HubWindow(QMainWindow):
             return
         self._log.append_line(f"Loaded {name} ({self._experiment.type.label}).")
         self._refresh_all()
+        ## Loading is a means, not an end: the next thing anyone does with a
+        ## member is analyse it, so the double-click lands them there rather
+        ## than leaving the Project panel open over a now-live Analyze tile.
+        self._open_panel_for("analyze")
 
     # ── refresh ────────────────────────────────────────────────────────────
 
     def _refresh_all(self) -> None:
+        ## Re-read the members from disk first. Project.members() caches, and
+        ## every surface below reads through it — so after a config write (an
+        ## exclusion group set here, a script run, an edit in another window)
+        ## the table went on showing the state the Project was loaded with,
+        ## and a member that had just gone stale never said so. Cheap: one
+        ## small YAML per member, which is what the status contract assumes.
+        if self._project is not None:
+            self._project.members(reload=True)
         self._refresh_tables()
         self._refresh_action_panels()
         self._refresh_scripts()
@@ -540,12 +724,25 @@ class HubWindow(QMainWindow):
         self._refresh_tiles()
 
     def _refresh_tiles(self) -> None:
-        batch_projects = len(self._batch.project_dirs()) if self._batch else 0
-        self._tiles["batch"].set_dimmed(self._batch is None)
-        self._tiles["batch"].set_summary(
-            [f"{batch_projects} project(s)", self._batch.name] if self._batch
-            else ["no batch selected", "select a folder of projects"])
+        ## Batch and Project are never dimmed, whatever is selected: they are
+        ## the two ways INTO the Hub — their panels hold the pickers that
+        ## create the state everything else waits on, so they must not read as
+        ## unavailable when nothing is loaded yet.
+        self._tiles["batch"].set_dimmed(False)
+        if self._batch is not None:
+            blocked = self._batch.blocked_count()
+            headline = f"{len(self._batch.batch_projects())} project(s)"
+            if blocked:
+                headline += f" · {blocked} blocked"
+            self._tiles["batch"].set_summary([headline, self._batch.name])
+        elif self._project is not None:
+            self._tiles["batch"].set_summary(
+                ["selection is a project", "open its parent to batch"])
+        else:
+            self._tiles["batch"].set_summary(
+                ["no batch selected", "click here ▸ Choose batch folder…"])
 
+        self._tiles["project"].set_dimmed(False)
         if self._project is not None:
             members = self._project.members()
             analysed = sum(1 for m in members if m.status().analyzed)
@@ -553,21 +750,22 @@ class HubWindow(QMainWindow):
                       else "double-click a member to load")
             self._tiles["project"].set_summary(
                 [f"{len(members)} member(s) · {analysed} analysed", loaded])
-            self._tiles["project"].set_dimmed(False)
         elif self._experiment is not None:
             self._tiles["project"].set_summary(
                 ["standalone experiment", self._experiment.name])
-            self._tiles["project"].set_dimmed(True)
+        elif self._batch is not None:
+            ## A Batch is selected but no Project inside it: the fix is
+            ## double-clicking a row in the Batch panel's table.
+            self._tiles["project"].set_summary(
+                [self._batch.name, "double-click a project"])
         elif self._selection is None:
             ## Nothing is selected on launch, so the tile has to say where the
             ## way in is now that the top bar has no Open button.
             self._tiles["project"].set_summary(
                 ["nothing selected", "click here ▸ Open project…"])
-            self._tiles["project"].set_dimmed(True)
         else:
             self._tiles["project"].set_summary(
                 ["not a project yet", "Tools ▸ Upgrade or Create project"])
-            self._tiles["project"].set_dimmed(True)
 
         has_exp = self._experiment is not None
         for key in ("analyze", "qc", "plots", "scripts"):
@@ -595,12 +793,23 @@ class HubWindow(QMainWindow):
                               ("scripts", "load one to run scripts")):
                 self._tiles[key].set_summary([hint, ""])
 
+        ## The AI tile is about the SUBJECT as much as the provider key: with
+        ## a key but no Project loaded it used to sit lit next to a dimmed AI
+        ## card.
         providers = self._ai_provider.count()
-        self._tiles["ai"].set_dimmed(providers == 0 or self._project is None)
-        self._tiles["ai"].set_summary(
-            [f"{providers} provider(s) configured",
-             "per-member + across-members"])
+        if not providers:
+            self._tiles["ai"].set_dimmed(True)
+            self._tiles["ai"].set_summary(["no API key", "add one to .env"])
+        else:
+            ready = self._project is not None
+            self._tiles["ai"].set_dimmed(not ready)
+            self._tiles["ai"].set_summary(
+                [f"{providers} provider(s)",
+                 "per-member + across-members" if ready
+                 else "select a project first"])
         self._tiles["tools"].set_summary(["directory tools", ""])
+        self._refresh_card_dimming()
+        self._refresh_report_button()
 
         rows = [("Selection", str(self._selection or "none"))]
         if self._project is not None:
@@ -615,19 +824,116 @@ class HubWindow(QMainWindow):
             rows.append(("Experiment", "none loaded"))
         self._status_panel.set_rows(rows)
 
+    def _refresh_report_button(self) -> None:
+        """View reports needs something to view.
+
+        Enabled on the Project report OR any member report: unlike the sister
+        app there is nothing pooled to lay beside the members, so one half on
+        its own is still a useful thing to open.
+        """
+        button = getattr(self, "_btn_view_reports", None)
+        if button is None:
+            return
+        if self._project is None:
+            button.setEnabled(False)
+            button.setToolTip("Select a Project first.")
+            return
+        members = self._member_report_paths(self._project)
+        project_report = self._project.report_path.is_file()
+        button.setEnabled(project_report or bool(members))
+        if project_report and members:
+            button.setToolTip(f"Open the Project report and {len(members)} "
+                              "member report(s), each in your PDF viewer.")
+        elif project_report:
+            button.setToolTip("Open the Project report. No member reports yet.")
+        elif members:
+            button.setToolTip(f"Open {len(members)} member report(s). No "
+                              "Project report yet — run Project report first.")
+        else:
+            button.setToolTip("No reports yet — run Project report first.")
+
+    def _refresh_card_dimming(self) -> None:
+        """Grey the cards whose actions have no subject yet.
+
+        Same gating as the buttons inside them (and the tiles above them):
+        everything experiment-level waits on a loaded Member Experiment, and
+        the AI narrative waits on a Project. The cards stay live — dimming
+        says "nothing to act on", not "do not touch" — which is why the Batch
+        and Project panels are absent from this list: they hold the pickers
+        that create the state everything else waits on.
+        """
+        loaded = self._experiment is not None
+        for key, ready in (("qc", loaded), ("analyze", loaded),
+                           ("plots", loaded), ("scripts", loaded),
+                           ("ai", self._project is not None
+                            and self._ai_provider.count() > 0)):
+            for card in self._panels[key].cards():
+                card.set_dimmed(not ready)
+        ## The Project panel is mixed: its first card carries Open and Create,
+        ## which must stay bright with nothing selected, while the two below
+        ## it act on a Project that may not exist yet.
+        for card in (self._project_actions_card, self._project_scripts_card):
+            card.set_dimmed(self._project is None)
+
+    def _restyle_cards(self) -> None:
+        """Repaint every card for the current theme — card surfaces are theme
+        colours too, dimmed ones especially."""
+        for panel in self._panels.values():
+            for card in panel.cards():
+                card.restyle()
+
     def _refresh_tables(self) -> None:
+        ## Rebuilding must not silently re-check a Project the user unchecked;
+        ## a new row defaults to checked unless nothing in it can run, which
+        ## can only produce a failure.
+        previous = {}
+        for row in range(self._batch_table.rowCount()):
+            item = self._batch_table.item(row, 0)
+            if item is not None:
+                previous[item.text()] = item.checkState()
         self._batch_table.setRowCount(0)
+        live = self._batch is not None
+        self._batch_empty.setVisible(not live)
+        for widget in self._batch_widgets:
+            widget.setEnabled(live)
+        if not live:
+            ## Clear the picker too. Leaving the previous Batch's central
+            ## project_scripts: listed made a designation from a folder the
+            ## user had navigated away from look like it was still in force.
+            self._batch_script.clear()
         if self._batch is not None:
-            for d in self._batch.project_dirs():
+            for entry in self._batch.batch_projects():
                 try:
-                    project = Project(d)
+                    project = Project(entry.directory)
                     type_label = project.type.label
-                    members = str(len(project.members()))
                     report = "yes" if project.report_path.is_file() else "no"
                 except Exception as exc:  # noqa: BLE001 - a bad Project still lists
-                    type_label, members, report = f"error: {exc}", "—", "—"
-                self._append_row(self._batch_table,
-                                 [d.name, type_label, members, report])
+                    type_label, report = f"error: {exc}", "—"
+                blocked = entry.blocked
+                self._append_row(self._batch_table, [
+                    entry.key, type_label,
+                    f"{len(entry.usable)}/{len(entry.members)}", report,
+                    f"{len(blocked)} blocked" if blocked else "ok",
+                ])
+                row = self._batch_table.rowCount() - 1
+                item = self._batch_table.item(row, 0)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(previous.get(
+                    entry.key, Qt.CheckState.Checked if entry.runnable
+                    else Qt.CheckState.Unchecked))
+                item.setToolTip(str(entry.directory))
+                if blocked:
+                    ## Red, with the reasons in the tooltip: the panel has no
+                    ## room for them and the preflight is one click away.
+                    brush = QBrush(blocked_color())
+                    detail = "\n".join(m.describe() for m in blocked)
+                    for column in range(self._batch_table.columnCount()):
+                        cell = self._batch_table.item(row, column)
+                        if cell is not None:
+                            cell.setForeground(brush)
+                            cell.setToolTip(
+                                f"{entry.key}\n\n{detail}" if column == 0
+                                else detail)
             self._batch_script.clear()
             from ..script_editor import project_actions
 
@@ -647,13 +953,32 @@ class HubWindow(QMainWindow):
         if self._project is not None:
             for member in self._project.members():
                 st = member.status()
+                ## "re-run needed" beats a bare date: the saved results are
+                ## real, they are just of a different analysis population
+                ## than the config now asks for.
+                analysed = "no"
+                if st.analyzed:
+                    analysed = "re-run needed" if st.stale else (st.analyzed_at or "yes")
                 self._append_row(self._members_table, [
                     member.name,
                     member.type.label,
                     str(st.n_total or "—"),
-                    (st.analyzed_at or "yes") if st.analyzed else "no",
+                    analysed,
                     st.exclusion_group or "none",
                 ])
+                if st.stale:
+                    row = self._members_table.rowCount() - 1
+                    brush = QBrush(blocked_color())
+                    detail = (f"Analysed under exclusion group "
+                              f"{st.analysed_group or 'none'!r}, but the "
+                              f"config now asks for "
+                              f"{st.exclusion_group or 'none'!r}. Re-run the "
+                              f"analysis so the saved results match.")
+                    for column in range(self._members_table.columnCount()):
+                        cell = self._members_table.item(row, column)
+                        if cell is not None:
+                            cell.setForeground(brush)
+                            cell.setToolTip(detail)
             self._project_script.clear()
             from ..script_editor import project_actions
 
@@ -753,7 +1078,11 @@ class HubWindow(QMainWindow):
             return
         self._log.append_line(f"▶ {name}")
         worker = TaskWorker(name, fn)
-        worker.log_text.connect(self._log.append_line)
+        ## append_STREAM: log_text carries raw stdout chunks, and `print`
+        ## writes its text and its terminator separately. Treating each chunk
+        ## as a finished line put a blank row after every printed line and
+        ## broke wide pandas tables apart.
+        worker.log_text.connect(self._log.append_stream)
         worker.figure_ready.connect(self._on_figure)
         worker.finished_ok.connect(lambda msg: self._log.append_line(f"✔ {msg}"))
         worker.failed.connect(lambda msg: self._log.append_line(f"✘ {msg}"))
@@ -762,7 +1091,31 @@ class HubWindow(QMainWindow):
         worker.start()
 
     def _on_figure(self, title: str, figure) -> None:
+        if self._tabs_suppressed():
+            ## Closed, not merely skipped: a figure that never becomes a tab
+            ## has no widget to own it, and pyplot would hold it for the life
+            ## of the process — over a Batch Run that is exactly the leak the
+            ## switch exists to avoid. The file is on disk either way.
+            try:
+                import matplotlib.pyplot as plt
+
+                plt.close(figure)
+            except Exception:  # noqa: BLE001
+                pass
+            self._log.append_line(
+                f"[plot] {title} not shown — 'Suppress new plot tabs' is on "
+                "(Batch panel).")
+            return
         self._plots.add_figure(title, figure)
+
+    def _tabs_suppressed(self) -> bool:
+        """The Batch panel's 'Suppress new plot tabs' switch.
+
+        Read through ``getattr`` because the log starts flowing before the
+        panels are built, and a task can outlive the panel that owns the box.
+        """
+        box = getattr(self, "_chk_suppress_tabs", None)
+        return box is not None and box.isChecked()
 
     def _run_action(self, key: str) -> None:
         """Execute one Analyze button — the same action a script step names."""
@@ -796,16 +1149,112 @@ class HubWindow(QMainWindow):
 
     # ── actions ────────────────────────────────────────────────────────────
 
-    def _action_run_batch(self) -> None:
+    def _action_run_batch(self, focus: str | None = None) -> None:
+        """Review, then run.
+
+        The preflight is always shown — with recursive discovery the folder
+        the user picked no longer says what will run, and that target list is
+        the one thing no other surface states.
+        """
         if self._batch is None:
             self._warn("Select a directory that holds Projects first.")
             return
+        dialog = BatchPreflightDialog(
+            self, self._batch.directory,
+            checked=self._batch_checked_keys(), log=self._log.append_line)
+        if focus is not None:
+            dialog.focus_member(focus)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        ## Scaffolding inside the dialog changes the tree either way, so the
+        ## cached walk is stale whether or not the run goes ahead.
+        self._batch.rescan()
+        self._refresh_all()
+        if not accepted:
+            return
+        keys = dialog.selected_keys
+        if not keys:
+            self._warn("No Projects checked — check at least one row.")
+            return
+
         batch, name = self._batch, self._batch_script.currentText()
         if name == BATCH_OWN_SCRIPT_ITEM:
             name = None                       # no designation: each its own
         label = name or f"each project's own {DEFAULT_PROJECT_SCRIPT_NAME!r} script"
         self._spawn(f"Batch run: {label}",
-                    lambda: batch.run(name, log=print).summary())
+                    lambda: batch.run(name, log=print,
+                                      project_names=keys).summary())
+
+    def _batch_checked_keys(self) -> list[str]:
+        """The Projects checked in the Batch table, by key."""
+        keys = []
+        for row in range(self._batch_table.rowCount()):
+            item = self._batch_table.item(row, 0)
+            if item is not None and item.checkState() == Qt.CheckState.Checked:
+                keys.append(item.text())
+        return keys
+
+    def _action_rescan_batch(self) -> None:
+        if self._batch is None:
+            self._warn("Select a directory that holds Projects first.")
+            return
+        found = self._batch.rescan()
+        blocked = self._batch.blocked_count()
+        self._log.append_line(
+            f"[batch] rescanned {self._batch.directory}: "
+            f"{len(found['projects'])} project(s)"
+            + (f", {blocked} blocked member(s)" if blocked else ""))
+        for key, why in found["skipped"]:
+            self._log.append_line(f"[batch] {key} skipped — {why}")
+        self._refresh_all()
+
+    def _batch_entry_at(self, row: int):
+        """The scanned Project on table *row*, or None if it has gone."""
+        item = self._batch_table.item(row, 0)
+        if item is None or self._batch is None:
+            return None
+        for entry in self._batch.batch_projects():
+            if entry.key == item.text():
+                return entry
+        return None
+
+    def _batch_menu(self, point) -> None:
+        """Right-click on a project row: repair its blocked members."""
+        item = self._batch_table.itemAt(point)
+        if item is None:
+            return
+        entry = self._batch_entry_at(item.row())
+        if entry is None:
+            return
+        menu = QMenu(self)
+        fix = menu.addAction(f"Fix blocked members in {entry.key}…")
+        fix.setEnabled(bool(entry.blocked))
+        if entry.blocked:
+            fix.setToolTip("\n".join(m.describe() for m in entry.blocked))
+        open_it = menu.addAction(f"Open {entry.key}")
+        chosen = menu.exec(self._batch_table.viewport().mapToGlobal(point))
+        if chosen is fix:
+            ## The same review window, so its Run button means the same thing
+            ## it does everywhere else.
+            self._action_run_batch(focus=entry.key)
+        elif chosen is open_it:
+            self._open_batch_project(entry)
+
+    def _on_batch_double_clicked(self, index) -> None:
+        entry = self._batch_entry_at(index.row())
+        if entry is not None:
+            self._open_batch_project(entry)
+
+    def _open_batch_project(self, entry) -> None:
+        """Enter a Batch Project and switch the visible panel to it.
+
+        The selection still names exactly one working container, so this is an
+        ordinary selection change down to that Project — there is no drill-in
+        state and no "up to batch" button; reaching the Batch again is picking
+        its folder.
+        """
+        self._set_selection(entry.directory)
+        self._refresh_all()
+        self._open_panel_for("project")
 
     def _action_run_project_script(self) -> None:
         if self._project is None:
@@ -851,18 +1300,97 @@ class HubWindow(QMainWindow):
         self._spawn("Project report", _job)
 
     def _action_validate_project(self) -> None:
+        """Check the Project's YAML and every member's, not just the loaded one.
+
+        A Project is exactly where a problem hides from a per-member check:
+        the one hard cross-member rule is the shared Experiment Type, and a
+        member whose config was never scaffolded is invisible to the members
+        table until a Batch Run fails on it.
+        """
         if self._project is None:
             self._warn("No Project selected.")
             return
+        checked = 1 + len(self._project.member_dirs())
         problems = self._project.validate()
         if problems:
             self._log.append_line("Project validation problems:")
-            for p in problems:
-                self._log.append_line(f"  - {p}")
+            for problem in problems:
+                self._log.append_line(f"  - {problem}")
         else:
             self._log.append_line("Project validation passed.")
         for divergence in self._project.divergences():
             self._log.append_line(f"  divergence — {divergence}")
+
+        ## Blocked members are a validation result too — a directory holding
+        ## data with no config is not a member yet, so nothing above sees it.
+        blocked = [m for m in layout_mod.members_in(self._project.directory)
+                   if m.blocked]
+        for member in blocked:
+            self._log.append_line(f"  blocked — {member.describe()}")
+        self._log.append_line(
+            f"[validate] {checked} file(s) checked, {len(problems)} "
+            f"problem(s), {len(blocked)} blocked member(s).")
+
+    def _member_report_paths(self, project) -> list[Path]:
+        """Every per-member report that exists on disk, in table order.
+
+        A member's report is named for its DIRECTORY, not the data file inside
+        it, which is the same rule the pipeline writes it under.
+        """
+        found = []
+        for directory in project.member_dirs():
+            candidate = directory / "analysis" / f"{directory.name}_report.pdf"
+            if candidate.is_file():
+                found.append(candidate)
+        return found
+
+    def _action_view_reports(self) -> None:
+        """Open the Project report and every member report at once."""
+        if self._project is None:
+            self._warn("No Project selected.")
+            return
+        targets = []
+        if self._project.report_path.is_file():
+            targets.append(self._project.report_path)
+        targets += self._member_report_paths(self._project)
+        if not targets:
+            self._warn("No reports yet — run Project report first.")
+            return
+        opened = sum(1 for path in targets if self._open_pdf(path))
+        if opened:
+            self._log.append_line(
+                f"[reports] opened {opened} report(s) in your PDF viewer.")
+
+    def _open_pdf(self, path: Path) -> bool:
+        """Hand *path* to the desktop's PDF viewer; the viewer decides window
+        vs tab.
+
+        ``QDesktopServices`` covers all three desktops (ShellExecute, Launch
+        Services, xdg-open). It can still fail on a Linux box with no
+        xdg-utils and no registered handler, so each platform's own opener is
+        tried before giving up.
+        """
+        import os
+        import subprocess
+
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtGui import QDesktopServices
+
+        if QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+            return True
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(path))  # noqa: S606 — the OS picks the app
+            elif sys.platform == "darwin":
+                ## -n: a new instance, so several files cannot collapse into
+                ## one reused window.
+                subprocess.Popen(["open", "-n", str(path)], close_fds=True)
+            else:
+                subprocess.Popen(["xdg-open", str(path)], close_fds=True)
+        except Exception as err:  # noqa: BLE001
+            self._log.append_line(f"[reports] could not open {path.name}: {err}")
+            return False
+        return True
 
     def _action_add_member(self) -> None:
         if self._project is None:
@@ -1140,6 +1668,7 @@ class HubWindow(QMainWindow):
         self._status_panel.restyle()
         for panel in self._panels.values():
             panel.restyle()
+        self._restyle_cards()
 
 
 def main() -> None:

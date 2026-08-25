@@ -57,6 +57,14 @@ class ExperimentStatus:
     n_excluded: int = 0
     analyzed_at: str | None = None
     problems: tuple[str, ...] = ()
+    #: The Exclusion Group the SAVED results were produced under, as stamped
+    #: in the run summary. ``exclusion_group`` above stays what the config
+    #: asks for now; the two disagreeing is what :attr:`stale` means.
+    analysed_group: str | None = None
+    #: The active Exclusion Group is not the one the saved results were
+    #: produced under, so those results describe a different analysis
+    #: population than the config now asks for.
+    stale: bool = False
 
 
 class SurvivalExperiment:
@@ -279,5 +287,18 @@ class SurvivalExperiment:
             st.factors = tuple(payload.get("factors") or ())
             st.analyzed_at = payload.get("analyzed_at")
             st.n_excluded = int(payload.get("n_excluded") or 0)
-            st.exclusion_group = payload.get("exclusion_group", st.exclusion_group)
+            ## Stale = the configuration disagrees with what the saved run
+            ## recorded. An Exclusion Group is configuration, not UI state,
+            ## and it is stamped on every output precisely so the same input
+            ## and config always give the same result — which means a changed
+            ## group makes the saved numbers describe a population nobody
+            ## asked for. Compared by name, not by mtime: copying a Project
+            ## between drives reorders mtimes but never the stamp.
+            ##
+            ## `exclusion_group` deliberately stays the CONFIG's value: it is
+            ## what the next run will use, and what the QC panel is showing.
+            ## The recorded one is a fact about the old results, so it belongs
+            ## beside them rather than replacing the live setting.
+            st.analysed_group = payload.get("exclusion_group")
+            st.stale = (st.analysed_group or None) != (self.exclusion_group or None)
         return st

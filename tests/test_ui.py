@@ -52,7 +52,20 @@ def test_the_strip_has_all_eight_tiles(hub):
 def test_a_project_selection_lights_the_project_tile(hub):
     assert hub._project is not None
     assert not hub._tiles["project"].is_dimmed()
-    assert hub._batch is None and hub._tiles["batch"].is_dimmed()
+    assert hub._batch is None
+
+
+def test_the_two_ways_in_are_never_dimmed(hub):
+    """Batch and Project stay lit whatever is selected.
+
+    Their panels hold the pickers that create the state every other tile
+    waits on, so a dimmed Batch tile would say "unavailable" about the one
+    control that makes it available. They say what to do next in words
+    instead.
+    """
+    assert not hub._tiles["batch"].is_dimmed()
+    assert not hub._tiles["project"].is_dimmed()
+    assert "project" in hub._tiles["batch"].summary_text()
 
 
 def test_experiment_tiles_dim_until_something_is_loaded(hub):
@@ -214,7 +227,9 @@ def test_a_standalone_experiment_selects_and_loads_itself(qapp, tmp_path):
     try:
         assert window._experiment is not None
         assert window._project is None
-        assert window._tiles["project"].is_dimmed()
+        ## Not dimmed — the Project tile is a way in, and its panel is where
+        ## "Create project…" lives. It says the state in words instead.
+        assert not window._tiles["project"].is_dimmed()
         assert "standalone" in window._tiles["project"].summary_text()
     finally:
         window.close()
@@ -282,3 +297,250 @@ def test_script_editor_switches_level_and_registry(qapp, analysed_project):
         assert window._target_path().name == "project.yaml"
     finally:
         window.close()
+
+
+# ---------------------------------------------------------------------------
+# The recursive Batch panel, and the polish that came with it
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def nested_batch(tmp_path):
+    """A Batch whose Projects sit at two different depths, one of them with a
+    member that nothing can run."""
+    from pysurvanalysis.domain import Project
+    from tests.conftest import make_experiment_dir, write_cohort
+
+    for group, name in (("Sept2026", "ProjA"), ("Archive/2025", "ProjB")):
+        directory = tmp_path / group / name
+        Project.create(directory, type_key="standard_lifespan")
+        make_experiment_dir(directory / "m1", type_key="standard_lifespan",
+                            minimal=True, seed=1)
+    write_cohort(tmp_path / "Sept2026" / "ProjA" / "m2" / "data" / "c.csv")
+    return tmp_path
+
+
+@pytest.fixture
+def batch_hub(qapp, nested_batch):
+    from pysurvanalysis.apps.hub import HubWindow
+
+    window = HubWindow(str(nested_batch))
+    yield window
+    window.close()
+
+
+def _batch_rows(hub):
+    return [[hub._batch_table.item(row, col).text()
+             for col in range(hub._batch_table.columnCount())]
+            for row in range(hub._batch_table.rowCount())]
+
+
+def test_the_batch_panel_lists_projects_at_any_depth(batch_hub):
+    assert batch_hub._batch is not None
+    names = [row[0] for row in _batch_rows(batch_hub)]
+    assert names == ["Archive/2025/ProjB", "Sept2026/ProjA"]
+
+
+def test_a_row_states_its_usable_members_and_its_block_count(batch_hub):
+    rows = {row[0]: row for row in _batch_rows(batch_hub)}
+    assert rows["Sept2026/ProjA"][2] == "1/2"
+    assert rows["Sept2026/ProjA"][4] == "1 blocked"
+    assert rows["Archive/2025/ProjB"][4] == "ok"
+
+
+def test_rebuilding_the_table_keeps_what_the_user_unchecked(batch_hub):
+    from PyQt6.QtCore import Qt as _Qt
+
+    batch_hub._batch_table.item(1, 0).setCheckState(_Qt.CheckState.Unchecked)
+    batch_hub._refresh_all()
+    assert batch_hub._batch_checked_keys() == ["Archive/2025/ProjB"]
+
+
+def test_double_clicking_a_row_selects_that_project_and_shows_its_panel(batch_hub):
+    index = batch_hub._batch_table.model().index(1, 0)
+    batch_hub._on_batch_double_clicked(index)
+    assert batch_hub._project is not None
+    assert batch_hub._project.directory.name == "ProjA"
+    assert batch_hub._open_panel == "project"
+
+
+def test_the_preflight_states_the_target_list(qapp, nested_batch):
+    from pysurvanalysis.apps.batch_preflight import BatchPreflightDialog
+
+    dialog = BatchPreflightDialog(None, nested_batch)
+    try:
+        assert "2 project(s) found" in dialog._heading.text()
+        assert "1 blocked member(s)" in dialog._heading.text()
+        assert dialog.selected_keys == ["Archive/2025/ProjB", "Sept2026/ProjA"]
+    finally:
+        dialog.close()
+
+
+def test_a_project_with_nothing_runnable_starts_unchecked(qapp, tmp_path):
+    """It could only produce a failure — but repairing it in the preflight
+    must put it back in the run, or the fix silently excludes the very Project
+    the user just fixed."""
+    from pysurvanalysis.apps.batch_preflight import BatchPreflightDialog
+    from pysurvanalysis.domain import Project
+    from tests.conftest import write_cohort
+
+    Project.create(tmp_path / "Broken", type_key="standard_lifespan")
+    write_cohort(tmp_path / "Broken" / "m" / "data" / "c.csv")
+    dialog = BatchPreflightDialog(None, tmp_path)
+    try:
+        assert dialog.selected_keys == []
+        dialog._fix_all()
+        assert dialog.selected_keys == ["Broken"]
+    finally:
+        dialog.close()
+
+
+def test_the_preflight_scaffolds_from_the_projects_own_defaults(qapp, nested_batch):
+    from pysurvanalysis.apps.batch_preflight import BatchPreflightDialog
+    from pysurvanalysis.domain import config as cfgmod
+
+    dialog = BatchPreflightDialog(None, nested_batch)
+    try:
+        dialog._fix_all()
+    finally:
+        dialog.close()
+    member = nested_batch / "Sept2026" / "ProjA" / "m2"
+    assert cfgmod.is_experiment_dir(member)
+    ## Minimal on purpose: a member that restates a default freezes it.
+    assert "global" not in cfgmod.load_config(member)
+
+
+def test_the_batch_tile_counts_projects_and_blocks(batch_hub):
+    text = batch_hub._tiles["batch"].summary_text()
+    assert "2 project(s)" in text and "1 blocked" in text
+
+
+def test_cards_dim_until_they_have_a_subject(hub):
+    for key in ("qc", "analyze", "plots", "scripts"):
+        assert all(card.is_dimmed() for card in hub._panels[key].cards()), key
+    ## ...but the two ways IN never dim: their panels hold the pickers.
+    assert not any(card.is_dimmed() for card in hub._panels["batch"].cards())
+    _load_first_member(hub)
+    for key in ("qc", "analyze", "plots", "scripts"):
+        assert not any(card.is_dimmed() for card in hub._panels[key].cards()), key
+
+
+def test_loading_a_member_lands_on_the_analyze_panel(hub):
+    _load_first_member(hub)
+    assert hub._open_panel == "analyze"
+
+
+def test_suppressing_tabs_closes_the_figure_instead_of_showing_it(hub):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    hub._chk_suppress_tabs.setChecked(True)
+    figure = plt.figure()
+    before = hub._plots.count()
+    hub._on_figure("a curve", figure)
+    assert hub._plots.count() == before
+    ## Closed, not merely skipped: with no tab to own it pyplot would hold the
+    ## figure for the life of the process.
+    assert not plt.fignum_exists(figure.number)
+
+
+def test_unsuppressed_figures_still_become_tabs(hub):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    hub._chk_suppress_tabs.setChecked(False)
+    before = hub._plots.count()
+    hub._on_figure("a curve", plt.figure())
+    assert hub._plots.count() == before + 1
+
+
+def test_the_output_log_reassembles_a_streamed_line(qapp):
+    """`print` writes its text and its terminator separately, so a chunk is
+    not a line. Treating each chunk as one put a blank row after every printed
+    line and broke wide tables apart."""
+    from pysurvanalysis.ui import OutputLog
+
+    log = OutputLog()
+    log.append_stream("one")
+    log.append_stream("\n")
+    log.append_stream("two\nthree")
+    log.append_stream("\n")
+    assert log.toPlainText().splitlines() == ["one", "two", "three"]
+
+
+def test_a_finished_message_never_glues_onto_a_partial_line(qapp):
+    from pysurvanalysis.ui import OutputLog
+
+    log = OutputLog()
+    log.append_stream("half a line")
+    log.append_line("a complete message")
+    assert log.toPlainText().splitlines() == ["half a line", "a complete message"]
+
+
+def test_clearing_the_output_leaves_the_tab_in_place(hub):
+    hub._log.append_line("something")
+    hub._plots.clear_output()
+    assert hub._log.toPlainText() == ""
+    assert hub._plots.count() >= 1
+    assert hub._plots.widget(0) is hub._log
+
+
+def test_a_member_analysed_under_another_exclusion_group_reads_stale(analysed_project):
+    """An Exclusion Group is configuration, stamped on every output so the
+    same input and config always give the same result — so a changed group
+    makes the saved numbers describe a population nobody asked for."""
+    from pysurvanalysis.domain import config as cfgmod
+
+    project, _results = analysed_project
+    member = project.member("rep_a")
+    assert not member.status().stale
+    config = cfgmod.load_config(member.directory)
+    config["exclusions"] = {"group": "review_v2"}
+    cfgmod.save_config(member.directory, config)
+    ## reload=True: members() caches, which is why _refresh_all re-reads.
+    project.members(reload=True)
+    assert project.member("rep_a").status().stale
+
+
+def test_the_members_table_notices_a_config_written_under_it(hub):
+    """The table is where member state is read, so it must reflect disk — not
+    the state the Project happened to be loaded with."""
+    from pysurvanalysis.domain import config as cfgmod
+
+    _load_first_member(hub)
+    hub._group_combo.setEditText("review_v2")
+    hub._action_set_exclusion_group()
+    row = [hub._members_table.item(0, col).text()
+           for col in range(hub._members_table.columnCount())]
+    assert row[0] == "rep_a"
+    assert row[3] == "re-run needed"
+    assert row[4] == "review_v2"
+
+
+def test_the_batch_controls_are_off_until_a_batch_is_selected(hub):
+    """The Project fixture selects a Project, which is never also a Batch."""
+    assert hub._batch is None
+    assert hub._batch_empty.isVisible() or not hub._panels["batch"].isVisible()
+    for widget in hub._batch_widgets:
+        assert not widget.isEnabled()
+
+
+def test_navigating_away_from_a_batch_clears_its_script_picker(batch_hub, tmp_path):
+    """A designation from a folder the user has left must not look like it is
+    still in force."""
+    from pysurvanalysis.domain import Project
+    from tests.conftest import make_experiment_dir
+
+    assert batch_hub._batch_script.count() > 0
+    elsewhere = tmp_path / "Solo"
+    Project.create(elsewhere, type_key="standard_lifespan")
+    make_experiment_dir(elsewhere / "m1", type_key="standard_lifespan",
+                        minimal=True)
+    batch_hub._set_selection(elsewhere)
+    batch_hub._refresh_all()
+    assert batch_hub._batch is None
+    assert batch_hub._batch_script.count() == 0
+    assert batch_hub._batch_table.rowCount() == 0

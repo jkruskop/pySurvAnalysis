@@ -427,7 +427,16 @@ class Project:
         return config
 
     def add_member(self, name: str, *, config: dict | None = None) -> SurvivalExperiment:
-        """Scaffold a new Member Experiment from the Project Defaults."""
+        """Scaffold a new Member Experiment from the Project Defaults.
+
+        *name* is a single folder name inside the Project. It is joined onto
+        the Project directory, so a separator or a ``..`` in it would write a
+        config — and a ``data/`` folder — outside the Project entirely.
+        """
+        if not name or name != Path(name).name or name in (".", ".."):
+            raise ProjectError(
+                f"{name!r} is not a member name — it must be a single folder "
+                f"name inside the project.")
         d = self.directory / name
         d.mkdir(parents=True, exist_ok=True)
         if not cfgmod.is_experiment_dir(d):

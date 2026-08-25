@@ -16,7 +16,14 @@ from __future__ import annotations
 from typing import Any
 
 from PyQt6.QtCore import QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QFontDatabase, QPalette, QPixmap, QTextCursor
+from PyQt6.QtGui import (
+    QColor,
+    QFontDatabase,
+    QIcon,
+    QPalette,
+    QPixmap,
+    QTextCursor,
+)
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QFrame,
@@ -26,6 +33,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -172,53 +180,97 @@ class Card(QFrame):
         title_row = QHBoxLayout()
         title_row.setSpacing(8)
 
-        if icon_name is not None:
-            ico = QLabel(self)
-            ico.setPixmap(icon(icon_name, category=category).pixmap(20, 20))
-            title_row.addWidget(ico)
+        self._icon = icon(icon_name, category=category) if icon_name else None
+        self._icon_lbl: QLabel | None = None
+        if self._icon is not None:
+            self._icon_lbl = QLabel(self)
+            title_row.addWidget(self._icon_lbl)
 
         self._title_lbl = QLabel(title, self)
         self._title_lbl.setObjectName("PsurvCardTitle")
-        # An explicit colour: with autoFillBackground on a custom Window role,
-        # qdarktheme leaves QLabel at a washed-out default in dark mode.
-        from .theme import surface_colors
-
-        self._title_lbl.setStyleSheet(
-            f"QLabel#PsurvCardTitle {{ "
-            f"  border-left: 4px solid {category_color(category)};"
-            f"  padding-left: 8px;"
-            f"  color: {surface_colors()['text']};"
-            f"}}"
-        )
         title_row.addWidget(self._title_lbl, 1)
+        self._title_row = title_row
 
         outer.addLayout(title_row)
 
+        self._subtitle_lbl: QLabel | None = None
         if subtitle:
             sub = QLabel(subtitle, self)
             sub.setObjectName("PsurvCardSubtitle")
             sub.setWordWrap(True)
             outer.addWidget(sub)
+            self._subtitle_lbl = sub
 
         self._body = QVBoxLayout()
         self._body.setSpacing(8)
         outer.addLayout(self._body)
 
-        # qdarktheme leaves the Base palette role at the platform's LIGHT value,
-        # so deriving the card background from it painted white cards on the
-        # dark UI. Resolve the surface explicitly instead.
+        self._dimmed = False
+        self.setAutoFillBackground(False)
+        self.restyle()
+
+    def set_dimmed(self, dimmed: bool) -> None:
+        """Grey the card's surface to show its actions have no subject yet.
+
+        Dimming is presentation only — the card stays live, so the control
+        that fixes the missing state (a picker, a checkbox) keeps working; the
+        actions themselves are gated with ``setEnabled`` as before.
+        """
+        if dimmed != self._dimmed:
+            self._dimmed = dimmed
+            self.restyle()
+
+    def is_dimmed(self) -> bool:
+        return self._dimmed
+
+    def restyle(self) -> None:
+        """Repaint the card for the CURRENT theme and dim state.
+
+        The colours come from ``surface_colors`` rather than palette roles,
+        which qdarktheme leaves at the platform's light values — deriving the
+        card background from ``Base`` painted white cards on the dark UI.
+
+        Every visible piece is repainted rather than fading the whole card
+        with a ``QGraphicsOpacityEffect``: an effect composites the card over
+        whatever is behind it, and behind it is a scroll viewport still
+        painting the platform's LIGHT base, so on the dark theme the "dim"
+        came out brighter than the live card.
+        """
         from .theme import surface_colors
 
         chrome = surface_colors()
+        base = QColor(chrome["base"])
+        if self._dimmed:
+            ## Away from the live surface in the direction the theme reads as
+            ## recessed, and far enough to survive a glance: on the dark theme
+            ## a few points of lightness is invisible.
+            bg = base.darker(112) if resolved_mode() == "light" else base.darker(150)
+            accent = text = chrome["muted"]
+        else:
+            bg, accent, text = base, category_color(self._category), chrome["text"]
         self.setStyleSheet(
-            f"QFrame#PsurvCard {{ background: {chrome['base']}; "
+            f"QFrame#PsurvCard {{ background: {bg.name()}; "
             f"border: 1px solid {chrome['border']}; border-radius: 10px; }}"
-            f"QFrame#PsurvCard QLabel {{ color: {chrome['text']}; "
+            f"QFrame#PsurvCard QLabel {{ color: {text}; "
             f"background: transparent; }}"
             f"QFrame#PsurvCard QLabel#PsurvCardSubtitle {{ "
             f"color: {chrome['muted']}; }}"
         )
-        self.setAutoFillBackground(False)
+        self._title_lbl.setStyleSheet(
+            f"QLabel#PsurvCardTitle {{"
+            f"  border-left: 4px solid {accent};"
+            f"  padding-left: 8px;"
+            f"  color: {text};"
+            f"}}"
+        )
+        if self._subtitle_lbl is not None:
+            self._subtitle_lbl.setStyleSheet(
+                f"QLabel#PsurvCardSubtitle {{ color: {chrome['muted']}; }}")
+        if self._icon_lbl is not None and self._icon is not None:
+            ## Qt's own greyed rendering — the category tint at full strength
+            ## was the loudest thing left on a dimmed card.
+            mode = QIcon.Mode.Disabled if self._dimmed else QIcon.Mode.Normal
+            self._icon_lbl.setPixmap(self._icon.pixmap(QSize(20, 20), mode))
 
     def body_layout(self) -> QVBoxLayout:
         return self._body
@@ -300,11 +352,76 @@ class OutputLog(QPlainTextEdit):
         mono.setStyleHint(mono.StyleHint.Monospace)
         self.setFont(mono)
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        #: Text written without a closing newline, waiting for the rest of its
+        #: line. It is displayed immediately (as its own block) and that block
+        #: is rewritten when the remainder arrives.
+        self._pending = ""
+        self._pending_shown = False
 
     def append_line(self, text: str) -> None:
-        self.appendPlainText(text.rstrip())
+        """Append *text* as one or more COMPLETE lines.
+
+        For callers that hand over a finished message — most of the app. A
+        trailing newline is optional and never treated as "more to come", so
+        two consecutive messages cannot run together.
+        """
+        if not text:
+            return
+        self._flush_pending()
+        lines = text.split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()          # a trailing newline closes, it does not add
+        for line in lines:
+            self.appendPlainText(line.rstrip())
+        self._after_append()
+
+    def append_stream(self, chunk: str) -> None:
+        """Append a raw chunk from a redirected ``stdout``.
+
+        Unlike :meth:`append_line` a chunk has no line discipline: ``print``
+        writes its text and its terminator separately, so one call can carry
+        several lines, a bare newline, or the front half of a line. Passing
+        those straight to ``appendPlainText`` put every fragment on its own
+        row, which is what broke pandas tables across the log. The trailing
+        fragment is shown immediately and rewritten in place when the rest of
+        it arrives, so nothing appears twice.
+        """
+        if not chunk:
+            return
+        lines = (self._pending + chunk).split("\n")
+        self._pending = lines.pop()
+        if self._pending_shown:
+            self._drop_last_block()
+            self._pending_shown = False
+        for line in lines:
+            self.appendPlainText(line.rstrip())
+        if self._pending:
+            self.appendPlainText(self._pending)
+            self._pending_shown = True
+        self._after_append()
+
+    def clear_log(self) -> None:
+        """Erase the scrollback, including any partially-streamed line."""
+        self.clear()
+        self._flush_pending()
+
+    def _flush_pending(self) -> None:
+        """Close off a partial streamed line, so a complete message from
+        somewhere else cannot be glued onto its end."""
+        self._pending = ""
+        self._pending_shown = False
+
+    def _after_append(self) -> None:
         self.moveCursor(QTextCursor.MoveOperation.End)
         self.ensureCursorVisible()
+
+    def _drop_last_block(self) -> None:
+        """Remove the block holding the partial line, so the completed line
+        replaces it rather than appearing twice."""
+        cursor = self.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.select(QTextCursor.SelectionType.BlockUnderCursor)
+        cursor.removeSelectedText()
 
 
 # ---------------------------------------------------------------------------
@@ -326,8 +443,50 @@ class PlotDock(QTabWidget):
         self.setDocumentMode(True)
         self.tabCloseRequested.connect(self._on_close)
 
+        self._output_log = output_log
         self.addTab(output_log, icon("info"), "Output")
         self.tabBar().setTabButton(0, self.tabBar().ButtonPosition.RightSide, None)
+        self.setCornerWidget(self._build_clear_bar(), Qt.Corner.TopRightCorner)
+
+    def _build_clear_bar(self) -> QWidget:
+        """Row of clear buttons in the dock's top-right corner.
+
+        One per thing that accumulates. A single "Clear plots" could not empty
+        a log that had been streaming for an hour, and closing the Output tab
+        is not an option — it is the one tab that never closes.
+        """
+        bar = QWidget(self)
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(0, 0, 4, 0)
+        lay.setSpacing(2)
+        for text, tip, slot in (
+            ("Clear plot tabs", "Close every figure tab and show the Output tab.",
+             self.clear_figures),
+            ("Clear output", "Erase the contents of the Output tab.",
+             self.clear_output),
+        ):
+            btn = QToolButton(bar)
+            btn.setText(text)
+            btn.setIcon(icon("clear"))
+            btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            btn.setAutoRaise(True)
+            btn.setToolTip(tip)
+            btn.clicked.connect(slot)
+            lay.addWidget(btn)
+        return bar
+
+    def clear_figures(self) -> None:
+        """Close every figure tab and return to the Output tab."""
+        for idx in range(self.count() - 1, 0, -1):
+            widget = self.widget(idx)
+            self.removeTab(idx)
+            if widget is not None:
+                widget.deleteLater()
+        self.setCurrentWidget(self._output_log)
+
+    def clear_output(self) -> None:
+        """Erase everything in the Output log."""
+        self._output_log.clear_log()
 
     def _on_close(self, idx: int) -> None:
         if idx == 0:
