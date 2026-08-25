@@ -12,6 +12,7 @@ version of the app — or by hand — is never silently truncated.
 from __future__ import annotations
 
 import copy
+import os
 from pathlib import Path
 from typing import Any
 
@@ -41,8 +42,15 @@ def config_path(directory: str | Path) -> Path:
 
 
 def is_experiment_dir(directory: str | Path) -> bool:
-    """True when *directory* is an Experiment Directory (has the marker file)."""
-    return config_path(directory).is_file()
+    """True when *directory* is an Experiment Directory (has the marker file).
+
+    ``os.path.isfile``, not ``Path.is_file`` — the latter propagates
+    ``PermissionError`` on Python 3.13, and this predicate is called over
+    arbitrary trees by the recursive Batch walk. A directory nobody can read
+    is "not an experiment", which the walk then reports; it must never be an
+    exception out of a structural test.
+    """
+    return os.path.isfile(config_path(directory))
 
 
 def load_config(directory: str | Path) -> dict:

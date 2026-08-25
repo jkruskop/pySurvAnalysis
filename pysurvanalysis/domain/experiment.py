@@ -9,6 +9,7 @@ about the object changes between those two cases.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,12 +23,17 @@ NON_DATA_NAMES = frozenset({"remove_chambers.csv"})
 
 
 def is_data_file(path: Path) -> bool:
-    """True for a plausible input file (not a sidecar, not an Excel lock file)."""
+    """True for a plausible input file (not a sidecar, not an Excel lock file).
+
+    ``os.path.isfile`` last, and tolerant: the Batch walk classifies
+    directories it does not own, and a stat that raises would take down the
+    whole scan over one unreadable file.
+    """
     return (
-        path.is_file()
-        and path.suffix.lower() in DATA_SUFFIXES
+        path.suffix.lower() in DATA_SUFFIXES
         and path.name.lower() not in NON_DATA_NAMES
         and not path.name.startswith("~$")
+        and os.path.isfile(path)
     )
 
 
