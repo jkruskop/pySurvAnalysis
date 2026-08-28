@@ -516,8 +516,9 @@ def test_the_members_table_notices_a_config_written_under_it(hub):
     row = [hub._members_table.item(0, col).text()
            for col in range(hub._members_table.columnCount())]
     assert row[0] == "rep_a"
-    assert row[3] == "re-run needed"
-    assert row[4] == "review_v2"
+    assert row[1] == "yes"
+    assert row[4] == "re-run needed"
+    assert row[5] == "review_v2"
 
 
 def test_the_batch_controls_are_off_until_a_batch_is_selected(hub):
@@ -544,3 +545,469 @@ def test_navigating_away_from_a_batch_clears_its_script_picker(batch_hub, tmp_pa
     assert batch_hub._batch is None
     assert batch_hub._batch_script.count() == 0
     assert batch_hub._batch_table.rowCount() == 0
+
+
+# ── the three states a folder can be in, at both levels ────────────────────
+
+@pytest.fixture
+def fresh_hub(qapp, tmp_path):
+    """A Hub over a throwaway Project.
+
+    Not the session-scoped ``hub`` fixture: these tests write directories into
+    the Project, and the shared one is read by every other test in this file.
+    """
+    from pysurvanalysis.apps.hub import HubWindow
+    from pysurvanalysis.domain import Project
+    from tests.conftest import make_experiment_dir
+
+    root = tmp_path / "states"
+    Project.create(root, name="States", type_key="interaction")
+    make_experiment_dir(root / "rep_a", minimal=True)
+    (root / "rep_b_bare").mkdir()
+    window = HubWindow(str(root))
+    ## Every action under test reports refusals through _warn, which is modal.
+    window._warned = []
+    window._warn = lambda message: window._warned.append(message)
+    yield window
+    window.close()
+
+
+def _member_rows(hub):
+    return [(hub._members_table.item(r, 0).text(),
+             hub._members_table.item(r, 1).text())
+            for r in range(hub._members_table.rowCount())]
+
+
+def test_the_members_table_shows_the_unconfigured_third_state(fresh_hub):
+    """A folder with no config is not a member, so nothing else in the Hub can
+    see it — and a table showing only members calls a half-set-up Project
+    complete."""
+    assert _member_rows(fresh_hub) == [("rep_a", "yes"), ("rep_b_bare", "missing")]
+
+
+def test_double_clicking_a_missing_row_offers_to_scaffold_it(fresh_hub, monkeypatch):
+    """The row is one config away from being a member, and asking beats
+    sending the user to a button they have not found yet."""
+    from PyQt6.QtWidgets import QMessageBox
+
+    from pysurvanalysis.apps import hub as hub_mod
+
+    monkeypatch.setattr(hub_mod.QMessageBox, "question",
+                        lambda *a, **k: QMessageBox.StandardButton.Yes)
+    index = fresh_hub._members_table.model().index(1, 0)
+    fresh_hub._on_member_double_clicked(index)
+    assert fresh_hub._experiment is None            # scaffolding is not loading
+    assert _member_rows(fresh_hub) == [("rep_a", "yes"), ("rep_b_bare", "yes")]
+
+
+def test_create_experiment_sends_an_existing_folder_to_initialize(fresh_hub):
+    """The two buttons cover different states; Create must not quietly adopt
+    whatever is already in the directory."""
+    fresh_hub._prompt_text = lambda *a, **k: "rep_b_bare"
+    fresh_hub._finish_new_member_config = lambda *a, **k: None
+    fresh_hub._action_create_experiment()
+    assert fresh_hub._warned and "Initialize existing directory" in fresh_hub._warned[-1]
+    assert _member_rows(fresh_hub) == [("rep_a", "yes"), ("rep_b_bare", "missing")]
+
+
+def test_create_experiment_scaffolds_a_minimal_member(fresh_hub):
+    """Minimal on purpose: a member that restates a default freezes it."""
+    from pysurvanalysis.domain import config as cfgmod
+
+    fresh_hub._prompt_text = lambda *a, **k: "rep_c"
+    fresh_hub._finish_new_member_config = lambda *a, **k: None
+    fresh_hub._action_create_experiment()
+    member = fresh_hub._project.member("rep_c")
+    assert member.data_dir.is_dir()
+    assert "global" not in cfgmod.load_config(member.directory)
+    assert ("rep_c", "yes") in _member_rows(fresh_hub)
+
+
+def test_initialize_existing_directory_makes_the_bare_folder_a_member(fresh_hub):
+    fresh_hub._prompt_choice = lambda title, label, options: options[0]
+    fresh_hub._action_initialize_experiment()
+    assert [m.name for m in fresh_hub._project.members()] == ["rep_a", "rep_b_bare"]
+    assert not fresh_hub._warned
+
+
+def test_initialize_existing_directory_says_when_there_is_nothing_to_do(fresh_hub):
+    fresh_hub._prompt_choice = lambda title, label, options: options[0]
+    fresh_hub._action_initialize_experiment()
+    fresh_hub._action_initialize_experiment()
+    assert "already has a" in fresh_hub._warned[-1]
+
+
+def test_the_member_actions_wait_for_a_project(fresh_hub, tmp_path):
+    """A member with nothing to inherit from is not a member."""
+    assert all(b.isEnabled() for b in fresh_hub._member_action_buttons)
+    bare = tmp_path / "not_a_project"
+    bare.mkdir()
+    fresh_hub._set_selection(bare)
+    fresh_hub._refresh_all()
+    assert not any(b.isEnabled() for b in fresh_hub._member_action_buttons)
+
+
+def test_the_fourth_project_button_only_ever_edits(fresh_hub, tmp_path):
+    """It is the editor for the Project that is open, and nothing else.
+
+    Writing a project.yaml into a directory that has none is what 'Initialize
+    existing directory…' does; having this button do it too gave the card two
+    controls with one behaviour.
+    """
+    assert fresh_hub._btn_edit_project_cfg.text() == "Edit config…"
+    assert fresh_hub._btn_edit_project_cfg.isEnabled()
+
+    bare = tmp_path / "not_a_project"
+    bare.mkdir()
+    fresh_hub._set_selection(bare)
+    fresh_hub._refresh_all()
+    assert fresh_hub._btn_edit_project_cfg.text() == "Edit config…"
+    assert not fresh_hub._btn_edit_project_cfg.isEnabled()
+
+    ## And it refuses rather than quietly creating one, naming the button
+    ## that does create it.
+    fresh_hub._action_edit_project_config()
+    assert "Initialize existing directory" in fresh_hub._warned[-1]
+    assert not (bare / "project.yaml").exists()
+
+
+def test_the_summary_line_describes_what_is_loaded(fresh_hub):
+    text = fresh_hub._project_summary.text()
+    assert "States" in text and "Interaction Experiment" in text
+    assert "1 member(s)" in text
+    assert "rep_b_bare" in text                     # the unconfigured folder
+
+
+# ── the project.yaml editor the three ways in share ────────────────────────
+
+def test_project_info_dialog_creates_the_directory_it_is_given(qapp, tmp_path):
+    from PyQt6.QtWidgets import QTableWidgetItem
+
+    from pysurvanalysis.apps.project_dialogs import ProjectInfoDialog
+    from pysurvanalysis.domain import Project
+
+    target = tmp_path / "brand_new"
+    dialog = ProjectInfoDialog(None, start_dir=str(target))
+    dialog.name_edit.setText("Brand new")
+    dialog.question_edit.setText("Does it help?")
+    dialog.type_combo.setCurrentIndex(dialog.type_combo.findData("interaction"))
+    dialog.factors_table.insertRow(0)
+    dialog.factors_table.setItem(0, 0, QTableWidgetItem("Genotype"))
+    dialog.factors_table.setItem(0, 1, QTableWidgetItem("wt, mut"))
+    dialog.accept()
+
+    assert dialog.saved_dir == str(target.resolve())
+    project = Project(target)
+    assert project.name == "Brand new"
+    assert project.question == "Does it help?"
+    assert project.type_key == "interaction"
+    assert project.defaults["factors"] == {"Genotype": ["wt", "mut"]}
+    ## Every Project ships a batch script, however it was made.
+    assert [s["name"] for s in project.scripts()] == ["batch"]
+
+
+def test_editing_a_project_carries_through_what_the_form_does_not_own(qapp, project):
+    """Scripts, styles, a key from a future version: an edit here must not be
+    a truncation."""
+    from pysurvanalysis.apps.project_dialogs import ProjectInfoDialog
+    from pysurvanalysis.domain import Project
+
+    project.config["defaults"]["something_new"] = {"kept": True}
+    project.save()
+
+    dialog = ProjectInfoDialog(None, start_dir=str(project.directory))
+    assert dialog.name_edit.text() == "Test project"
+    assert dialog.type_combo.currentData() == "interaction"
+    dialog.question_edit.setText("A sharper question")
+    dialog.accept()
+
+    reloaded = Project(project.directory)
+    assert reloaded.question == "A sharper question"
+    assert reloaded.type_key == "interaction"
+    assert reloaded.defaults["something_new"] == {"kept": True}
+    assert [s["name"] for s in reloaded.scripts()] == ["batch"]
+
+
+def test_initializing_infers_the_type_from_what_is_already_there(qapp, tmp_path):
+    """A study started before there were Projects already knows its type;
+    offering the alphabetically-first one would propose one its own contents
+    refute."""
+    from pysurvanalysis.apps.project_dialogs import ProjectInfoDialog
+    from pysurvanalysis.domain import Project
+    from tests.conftest import make_experiment_dir
+
+    legacy = tmp_path / "legacy_study"
+    make_experiment_dir(legacy / "run1", type_key="standard_lifespan")
+
+    dialog = ProjectInfoDialog(None, start_dir=str(legacy),
+                               initialize_existing=True)
+    assert dialog.type_combo.currentData() == "standard_lifespan"
+    assert dialog.name_edit.text() == "legacy_study"     # keeps its own name
+    dialog.accept()
+
+    project = Project(legacy)
+    assert project.type_key == "standard_lifespan"
+    assert [m.name for m in project.members()] == ["run1"]
+    assert project.validate() == []
+
+
+def test_initializing_refuses_a_directory_that_is_already_a_project(qapp, project,
+                                                                    monkeypatch):
+    from pysurvanalysis.apps import project_dialogs
+
+    warned = []
+    monkeypatch.setattr(project_dialogs.QMessageBox, "warning",
+                        lambda *a, **k: warned.append(a[-1]))
+    dialog = project_dialogs.ProjectInfoDialog(
+        None, start_dir=str(project.directory), initialize_existing=True)
+    assert dialog._resolved_target() is None
+    assert warned and "already a Project" in warned[-1]
+
+
+def test_member_configs_dialog_lists_both_states_and_creates_the_missing(
+        qapp, project, monkeypatch):
+    from pysurvanalysis.apps.project_dialogs import MemberConfigsDialog
+    from PyQt6.QtWidgets import QMessageBox
+    from pysurvanalysis.apps import project_dialogs
+
+    (project.directory / "rep_c").mkdir()
+    dialog = MemberConfigsDialog(None, project)
+    assert [(r.name, r.configured) for r in dialog._rows] == [
+        ("rep_a", True), ("rep_b", True), ("rep_c", False)]
+    assert dialog._btn_create_all.isEnabled()
+
+    monkeypatch.setattr(project_dialogs.QMessageBox, "question",
+                        lambda *a, **k: QMessageBox.StandardButton.Yes)
+    dialog._create_all_missing()
+    assert all(r.configured for r in dialog._rows)
+    assert dialog.changed
+    assert not dialog._btn_create_all.isEnabled()
+
+
+def test_no_panel_asks_for_more_width_than_it_gets(hub, qapp):
+    """A panel clips rather than scrolls sideways, so over-wide content just
+    disappears — silently, and only for whoever has the narrowest labels.
+
+    Measured against every panel, not just the one that broke: the failure is
+    a button row whose labels do not fit, and any card can grow one.
+    """
+    from pysurvanalysis.apps.hub import PANEL_WIDTH
+
+    for key, panel in hub._panels.items():
+        hub._open_panel_for(key)
+        qapp.processEvents()
+        host = panel._scroll.widget()
+        ## The panel's own frame margins and the host layout's, which the
+        ## content does not get (see TilePanel.__init__).
+        available = PANEL_WIDTH - 8 - 16
+        assert host.minimumSizeHint().width() <= available, (
+            f"the {key} panel needs {host.minimumSizeHint().width()}px of "
+            f"content width but has {available}px")
+    hub.close_panel()
+
+
+# ── publication figures live in two places, not four ───────────────────────
+
+def test_the_plots_panel_holds_only_contributed_actions(hub):
+    """Authoring a figure is Plot Editor work and rendering one is a Project
+    action, so neither belongs on this tile."""
+    from PyQt6.QtWidgets import QAbstractButton
+
+    cards = hub._panels["plots"].cards()
+    assert cards == [hub._plot_actions_card]
+    labels = [b.text() for c in cards for b in c.findChildren(QAbstractButton)]
+    assert not [t for t in labels if "figure" in t.lower() or "editor" in t.lower()]
+
+
+def test_rendering_figures_is_a_project_action_over_every_member(hub, tmp_path,
+                                                                 monkeypatch):
+    """One implementation, shared with a Batch Run: the rule about which
+    members get figures (ADR-0005) is stated in the action, not twice."""
+    from pysurvanalysis.script_editor import project_actions
+
+    calls = []
+    monkeypatch.setattr(project_actions, "run_script",
+                        lambda project, steps, **kw: calls.append((project, steps)))
+    monkeypatch.setattr(hub, "_spawn", lambda _name, fn: fn())
+
+    hub._fig_format.setCurrentText("pdf")
+    hub._action_render_figures()
+    assert len(calls) == 1
+    project, steps = calls[0]
+    assert project is hub._project                  # the Project, not a member
+    assert steps == [{"action": "render_publication_figures", "format": "pdf"}]
+
+
+def test_rendering_figures_needs_a_project_not_an_experiment(fresh_hub, tmp_path):
+    bare = tmp_path / "nothing"
+    bare.mkdir()
+    fresh_hub._set_selection(bare)
+    fresh_hub._refresh_all()
+    fresh_hub._action_render_figures()
+    assert fresh_hub._warned and "Select a Project first" in fresh_hub._warned[-1]
+
+
+def test_the_plot_editor_resolves_a_member_from_the_project_panel(fresh_hub,
+                                                                  monkeypatch):
+    """It is the only way into the editor now, so it resolves a subject rather
+    than refusing without a loaded experiment.
+
+    Specs are still per-experiment (ADR-0005) — the button just answers "which
+    member" from the panel it lives on instead of making the user load one.
+    """
+    opened = []
+
+    class _FakeEditor:
+        def __init__(self, experiment):
+            opened.append(experiment.name)
+
+        def show(self):
+            pass
+
+    import pysurvanalysis.apps.plot_editor as pe
+    monkeypatch.setattr(pe, "PlotEditorWindow", _FakeEditor)
+
+    ## One member: no question to ask.
+    fresh_hub._action_open_plot_editor()
+    assert opened == ["rep_a"]
+
+    ## Two members and a selected row: the selection decides.
+    fresh_hub._prompt_choice = lambda *a, **k: pytest.fail(
+        "should not ask when a row is selected")
+    fresh_hub._prompt_text = lambda *a, **k: "rep_z"
+    fresh_hub._finish_new_member_config = lambda *a, **k: None
+    fresh_hub._action_create_experiment()
+    row = next(r for r in range(fresh_hub._members_table.rowCount())
+               if fresh_hub._members_table.item(r, 0).text() == "rep_z")
+    fresh_hub._members_table.selectRow(row)
+    fresh_hub._action_open_plot_editor()
+    assert opened[-1] == "rep_z"
+
+
+def test_the_plot_editor_asks_which_member_when_nothing_points_at_one(fresh_hub,
+                                                                     monkeypatch):
+    import pysurvanalysis.apps.plot_editor as pe
+
+    opened = []
+
+    class _FakeEditor:
+        def __init__(self, experiment):
+            opened.append(experiment.name)
+
+        def show(self):
+            pass
+
+    monkeypatch.setattr(pe, "PlotEditorWindow", _FakeEditor)
+    fresh_hub._prompt_text = lambda *a, **k: "rep_z"
+    fresh_hub._finish_new_member_config = lambda *a, **k: None
+    fresh_hub._action_create_experiment()
+    fresh_hub._members_table.clearSelection()
+
+    asked = []
+    fresh_hub._prompt_choice = lambda title, label, options: (
+        asked.append(options) or options[-1])
+    fresh_hub._action_open_plot_editor()
+    assert asked == [["rep_a", "rep_z"]]
+    assert opened == ["rep_z"]
+
+
+# ── the Plot Editor's expanded controls ────────────────────────────────────
+
+@pytest.fixture
+def editor(qapp, tmp_path):
+    from pysurvanalysis.apps.plot_editor import PlotEditorWindow
+    from pysurvanalysis.domain import SurvivalExperiment
+    from tests.conftest import make_experiment_dir
+
+    directory = make_experiment_dir(tmp_path / "curated", type_key="interaction")
+    window = PlotEditorWindow(SurvivalExperiment(directory))
+    window.resize(1300, 900)
+    ## The curves are not known until the lifetables are read, which happens
+    ## on the first render.
+    window._refresh_preview()
+    yield window
+    window.close()
+
+
+def test_every_style_field_is_reachable_from_the_form(editor):
+    """A style with forty fields fails silently: a control is added, its field
+    is never harvested, and the figure just ignores it.
+
+    So the mapping tables are asserted to COVER the dataclass. ``name`` is the
+    Style's identity — chosen by the Save dialog, not edited in the form.
+    """
+    from dataclasses import fields
+
+    from pysurvanalysis import pubfigures as pf
+
+    mapped = {f for _attr, f in (editor._NUMBERS + editor._FLAGS
+                                 + editor._CHOICES + editor._COLOURS)}
+    mapped |= {"font_family", "risk_table_times", "palette", "palette_cycle"}
+    declared = {f.name for f in fields(pf.PlotStyle)} - {"name"}
+    assert declared - mapped == set(), \
+        f"style fields with no control: {sorted(declared - mapped)}"
+
+
+def test_every_mapped_control_round_trips(editor):
+    """Load → harvest must be lossless, or an edit made in one card is undone
+    by switching to another figure and back."""
+    style = editor.style
+    style.show_points = True
+    style.point_stroke = 0.7
+    style.point_shape = "s"
+    style.point_at = "all"
+    style.point_fill = "none"
+    style.title_pt = 13.0
+    style.tick_pt = 6.5
+    style.text_color = "#223344"
+    style.grid = "y"
+    style.strip_style = "boxed"
+    style.panel_border = True
+    style.panel_bg = "#fafafa"
+    style.line_pt = 1.4
+    style.risk_table_times = [0.0, 25.0, 50.0]
+
+    editor._load_style_into_form()
+    _spec, harvested = editor._harvest()
+
+    assert harvested.show_points is True
+    assert harvested.point_stroke == 0.7
+    assert harvested.point_shape == "s"
+    assert harvested.point_at == "all"
+    assert harvested.point_fill == "none"
+    assert harvested.title_pt == 13.0
+    assert harvested.tick_pt == 6.5
+    assert harvested.text_color == "#223344"
+    assert harvested.grid == "y"
+    assert harvested.strip_style == "boxed"
+    assert harvested.panel_border is True
+    assert harvested.panel_bg == "#fafafa"
+    assert harvested.line_pt == 1.4
+    assert harvested.risk_table_times == [0.0, 25.0, 50.0]
+
+
+def test_a_swatch_left_on_its_cycle_colour_is_not_pinned(editor):
+    """``palette`` means "explicitly assigned".
+
+    Without this, merely opening the editor and touching anything would write
+    every curve's colour into the shared Style, and the fallback cycle would
+    stop meaning anything for every other member using that Style.
+    """
+    assert set(editor._series_swatches) == {"ctrl", "drug"}
+    _spec, style = editor._harvest()
+    assert style.palette == {}
+
+    editor._series_swatches["drug"].set_color("#aa3355")
+    _spec, style = editor._harvest()
+    assert style.palette == {"drug": "#aa3355"}
+
+    editor._reset_series_colours()
+    _spec, style = editor._harvest()
+    assert style.palette == {}
+
+
+def test_the_at_risk_times_field_ignores_a_half_typed_list(editor):
+    """It is read on every edit, so a list mid-typing is not an error."""
+    editor._risk_times.setText("0, 20, , 40x, 60")
+    _spec, style = editor._harvest()
+    assert style.risk_table_times == [0.0, 20.0, 60.0]

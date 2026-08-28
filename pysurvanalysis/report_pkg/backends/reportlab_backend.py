@@ -224,7 +224,9 @@ def _cover_flowables(block: m.Cover, styles) -> list:
 
 
 def _divider_flowables(block: m.SectionDivider, styles) -> list:
-    flow = [PageBreak(), Spacer(1, 3.6 * inch),
+    ## No leading PageBreak here: the caller adds one through
+    ## ``_start_page``, which knows whether the page is already fresh.
+    flow = [Spacer(1, 3.6 * inch),
             Paragraph(_xml_escape(block.title), styles["divider"])]
     if block.subtitle:
         flow.append(Spacer(1, 0.1 * inch))
@@ -301,12 +303,25 @@ def _figure_flowables(block: m.Figure, styles) -> list:
     return [KeepTogether(parts), Spacer(1, 0.15 * inch)]
 
 
+def _start_page(flow: list) -> None:
+    """Break to a new page, unless one is already about to start.
+
+    Two ``PageBreak``s in a row produce a page with nothing on it but the
+    running header and footer. That is easy to write by accident, because a
+    ``SectionDivider`` starts its own page and a caller cannot see that from
+    the model — so the rule lives here, once, rather than in every caller.
+    """
+    if flow and not isinstance(flow[-1], PageBreak):
+        flow.append(PageBreak())
+
+
 def _blocks_to_flowables(report: m.Report, styles) -> list:
     flow: list = []
     for block in report.blocks:
         if isinstance(block, m.Cover):
             flow += _cover_flowables(block, styles)
         elif isinstance(block, m.SectionDivider):
+            _start_page(flow)
             flow += _divider_flowables(block, styles)
         elif isinstance(block, m.Heading):
             key = {1: "h1", 2: "h2", 3: "h3"}.get(block.level, "h3")
@@ -323,7 +338,7 @@ def _blocks_to_flowables(report: m.Report, styles) -> list:
         elif isinstance(block, m.Figure):
             flow += _figure_flowables(block, styles)
         elif isinstance(block, m.PageBreak):
-            flow.append(PageBreak())
+            _start_page(flow)
         # Unknown blocks are silently skipped — forward-compatible with new
         # block types a newer analysis core might emit.
     return flow

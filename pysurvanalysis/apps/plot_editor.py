@@ -19,14 +19,16 @@ from ..gui_env import sanitize_input_method_environment
 ## platform plugin initialises.
 sanitize_input_method_environment()
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
+    QFontComboBox,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -46,6 +48,147 @@ from ..ui import ActionButton, Card, Category, OutputLog, TopBar, apply_theme, i
 from ..ui import settings as ui_settings
 
 
+#: Bounds on the preview's render resolution. The floor keeps a figure legible
+#: in a small window; the ceiling stops a maximised window on a 4K screen from
+#: rasterising a 3000px image nobody can see the extra detail in.
+_PREVIEW_MIN_DPI = 96
+_PREVIEW_MAX_DPI = 400
+
+
+class ColorButton(QPushButton):
+    """A small swatch; clicking opens a colour dialog.
+
+    The dialog exposes the alpha channel because two of the values here are
+    legitimately not colours: full transparency stores ``"none"``
+    (matplotlib's transparent, which is how a hollow point is asked for), and
+    partial alpha stores an ``#rrggbbaa`` hex. Both render.
+    """
+
+    changed = pyqtSignal()
+
+    def __init__(self, color: str = "#4C72B0", parent=None,
+                 auto_text: str = "auto") -> None:
+        super().__init__(parent)
+        self.setFixedSize(44, 22)
+        self._auto_text = auto_text
+        self._color = ""
+        self.set_color(color)
+        self.clicked.connect(self._pick)
+
+    def color(self) -> str:
+        return self._color
+
+    def _qcolor(self) -> QColor:
+        value = self._color
+        if value in ("", "none"):
+            return QColor(0, 0, 0, 0)
+        if len(value) == 9:                      # matplotlib #rrggbbaa
+            return QColor(int(value[1:3], 16), int(value[3:5], 16),
+                          int(value[5:7], 16), int(value[7:9], 16))
+        return QColor(value)
+
+    def set_color(self, color: str) -> None:
+        self._color = str(color or "")
+        if self._color in ("", "none"):
+            self.setText(self._auto_text if self._color == "" else "none")
+            self.setStyleSheet(
+                "QPushButton { background: palette(base); color: palette(mid);"
+                " border: 1px dashed palette(mid); border-radius: 3px;"
+                " font-size: 7pt; }")
+            return
+        self.setText("")
+        c = self._qcolor()
+        self.setStyleSheet(
+            f"QPushButton {{ background: rgba({c.red()},{c.green()},"
+            f"{c.blue()},{c.alpha()}); border: 1px solid palette(mid); "
+            f"border-radius: 3px; }}")
+
+    def _pick(self) -> None:
+        chosen = QColorDialog.getColor(
+            self._qcolor(), self, "Pick colour (alpha 0 = transparent)",
+            QColorDialog.ColorDialogOption.ShowAlphaChannel)
+        if not chosen.isValid():
+            return
+        alpha = chosen.alpha()
+        if alpha == 0:
+            self.set_color("none")
+        elif alpha < 255:
+            self.set_color(f"#{chosen.red():02x}{chosen.green():02x}"
+                           f"{chosen.blue():02x}{alpha:02x}")
+        else:
+            self.set_color(chosen.name())
+        self.changed.emit()
+
+
+## Wheel-transparent controls. Ignoring the wheel makes Qt bubble the event up
+## to the scroll area, so scrolling this long options panel never silently
+## edits whichever spinbox the cursor happened to be over.
+class _NoWheelSpin(QDoubleSpinBox):
+    def wheelEvent(self, event):  # noqa: N802 (Qt override)
+        event.ignore()
+
+
+class _NoWheelCombo(QComboBox):
+    def wheelEvent(self, event):  # noqa: N802 (Qt override)
+        event.ignore()
+
+
+class _NoWheelFontCombo(QFontComboBox):
+    def wheelEvent(self, event):  # noqa: N802 (Qt override)
+        event.ignore()
+
+
+def _spin(lo: float, hi: float, step: float = 0.1, decimals: int = 1,
+          special: str | None = None) -> _NoWheelSpin:
+    box = _NoWheelSpin()
+    box.setRange(lo, hi)
+    box.setSingleStep(step)
+    box.setDecimals(decimals)
+    box.setMaximumWidth(90)
+    if special is not None:
+        box.setSpecialValueText(special)
+    return box
+
+
+def _combo(items) -> _NoWheelCombo:
+    box = _NoWheelCombo()
+    box.addItems(list(items))
+    return box
+
+
+def _fmt_number(value) -> str:
+    """Render a float without a trailing ``.0`` — the times a user typed come
+    back looking like the times a user typed."""
+    number = float(value)
+    return str(int(number)) if number == int(number) else str(number)
+
+
+def _parse_numbers(text: str) -> list[float]:
+    """Comma- or space-separated numbers; anything unparseable is dropped
+    rather than raising, because this is read on every keystroke-ending edit
+    and a half-typed list is not an error."""
+    out: list[float] = []
+    for part in str(text or "").replace(",", " ").split():
+        try:
+            out.append(float(part))
+        except ValueError:
+            continue
+    return out
+
+
+def _row(*widgets) -> QWidget:
+    """Pack widgets onto one form row, so a value and its modifier stay
+    together instead of each taking a label of its own."""
+    holder = QWidget()
+    lay = QHBoxLayout(holder)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(6)
+    for w in widgets:
+        lay.addWidget(w)
+    lay.addStretch(1)
+    return holder
+
+
 class PlotEditorWindow(QMainWindow):
     """Live preview of one Spec+Style, and the two Save buttons behind it."""
 
@@ -62,6 +205,10 @@ class PlotEditorWindow(QMainWindow):
         self._current_id = (experiment.type.headline_plot_id
                             if experiment.type.headline_plot_id in self._specs
                             else next(iter(self._specs), None))
+
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.timeout.connect(self._refresh_preview)
 
         self._build_ui()
         self._load_spec_into_form()
@@ -94,8 +241,12 @@ class PlotEditorWindow(QMainWindow):
         side_lay.setContentsMargins(0, 0, 0, 0)
         side_lay.setSpacing(10)
         side_lay.addWidget(self._build_spec_card())
-        side_lay.addWidget(self._build_style_card())
+        side_lay.addWidget(self._build_canvas_card())
+        side_lay.addWidget(self._build_curves_card())
+        side_lay.addWidget(self._build_panels_card())
+        side_lay.addWidget(self._build_colours_card())
         side_lay.addStretch(1)
+        self._connect_style_controls()
         side_scroll = QScrollArea()
         side_scroll.setWidgetResizable(True)
         side_scroll.setWidget(side)
@@ -158,53 +309,260 @@ class PlotEditorWindow(QMainWindow):
         card.add_body(form)
         return card
 
-    def _build_style_card(self) -> Card:
-        card = Card("Style", Category.PLOTS, icon_name="config",
+    def _build_canvas_card(self) -> Card:
+        card = Card("Canvas & type", Category.PLOTS, icon_name="config",
                     subtitle="The shared look — saved up to the Project so "
                              "every member's figures match.")
         form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
-        self._width = QDoubleSpinBox(); self._width.setRange(40, 400)
-        self._height = QDoubleSpinBox(); self._height.setRange(30, 400)
-        for widget, label in ((self._width, "Width (mm):"),
-                              (self._height, "Height (mm):")):
-            widget.valueChanged.connect(self._refresh_preview)
-            form.addRow(label, widget)
+        self._width = _spin(40, 400, 5, 0)
+        self._height = _spin(30, 400, 5, 0)
+        form.addRow("Size (mm):", _row(self._width, QLabel("×"), self._height))
 
-        self._theme_combo = QComboBox()
-        self._theme_combo.addItems(list(pf.THEMES))
-        self._theme_combo.currentTextChanged.connect(self._refresh_preview)
+        self._theme_combo = _combo(pf.THEMES)
         form.addRow("Theme:", self._theme_combo)
 
-        self._base_size = QDoubleSpinBox(); self._base_size.setRange(5, 24)
-        self._base_size.valueChanged.connect(self._refresh_preview)
-        form.addRow("Base font size:", self._base_size)
+        self._font_combo = _NoWheelFontCombo()
+        self._font_combo.setMaximumWidth(200)
+        form.addRow("Font:", self._font_combo)
 
-        self._line_width = QDoubleSpinBox(); self._line_width.setRange(0.2, 5.0)
-        self._line_width.setSingleStep(0.1)
-        self._line_width.valueChanged.connect(self._refresh_preview)
-        form.addRow("Line width:", self._line_width)
+        self._base_size = _spin(4, 32, 0.5)
+        self._text_color = ColorButton("#000000", auto_text="black")
+        form.addRow("Base size (pt):", _row(self._base_size,
+                                            QLabel("  text:"),
+                                            self._text_color))
 
-        self._censor_ticks = QCheckBox("Censor ticks")
-        self._ci_band = QCheckBox("95% CI bands")
-        self._risk_table = QCheckBox("At-risk band below the curves")
-        for box in (self._censor_ticks, self._ci_band, self._risk_table):
-            box.stateChanged.connect(self._refresh_preview)
-            form.addRow("", box)
-
-        self._legend_pos = QComboBox()
-        self._legend_pos.addItems(["right", "left", "top", "bottom", "none"])
-        self._legend_pos.currentTextChanged.connect(self._refresh_preview)
-        form.addRow("Legend:", self._legend_pos)
+        ## Every one of these is 0 = "follow the base size", so a style that
+        ## only sets the base still scales as one thing. The overrides are for
+        ## the single element that has to differ.
+        self._title_pt = _spin(0, 40, 0.5, 1, special="auto")
+        self._axis_title_pt = _spin(0, 40, 0.5, 1, special="auto")
+        self._tick_pt = _spin(0, 40, 0.5, 1, special="auto")
+        self._legend_pt = _spin(0, 40, 0.5, 1, special="auto")
+        self._strip_pt = _spin(0, 40, 0.5, 1, special="auto")
+        for label, widget in (("Title (pt):", self._title_pt),
+                              ("Axis titles (pt):", self._axis_title_pt),
+                              ("Tick labels (pt):", self._tick_pt),
+                              ("Legend (pt):", self._legend_pt),
+                              ("Facet strips (pt):", self._strip_pt)):
+            widget.setToolTip("0 = follow the base size.")
+            form.addRow(label, widget)
 
         card.add_body(form)
+        return card
+
+    def _build_curves_card(self) -> Card:
+        card = Card("Curves & points", Category.PLOTS, icon_name="km",
+                    subtitle="The step curve itself, its markers, its censor "
+                             "ticks and its confidence band.")
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self._line_width = _spin(0.1, 6.0, 0.1)
+        self._line_pt = _spin(0.0, 4.0, 0.1)
+        self._line_pt.setToolTip(
+            "Axis lines, ticks and panel borders — the figure's furniture, "
+            "which is a different decision from the curve's own weight.")
+        form.addRow("Curve width:", _row(self._line_width,
+                                         QLabel("  axes:"), self._line_pt))
+
+        # ---- points ------------------------------------------------------
+        self._show_points = QCheckBox("Draw points on the curve")
+        self._show_points.setToolTip(
+            "Off by default: a lifespan cohort has an event on nearly every "
+            "day, and a marker per event buries the curve.")
+        form.addRow("", self._show_points)
+
+        self._point_at = _combo(pf.POINT_AT)
+        self._point_at.setToolTip(
+            "events = knots where survival actually fell (not the t=0 anchor, "
+            "not censoring-only knots); censored = knots with a censoring; "
+            "all = every observed time.")
+        form.addRow("Points at:", self._point_at)
+
+        self._point_shape = _combo(pf.POINT_SHAPES)
+        self._point_size = _spin(0.2, 12.0, 0.2)
+        form.addRow("Shape / size:", _row(self._point_shape, self._point_size))
+
+        self._point_alpha = _spin(0.0, 1.0, 0.05, 2)
+        self._point_fill = ColorButton("", auto_text="curve")
+        self._point_fill.setToolTip(
+            "The marker's interior. 'curve' follows the series colour; a fully "
+            "transparent pick gives a hollow marker.")
+        form.addRow("Opacity / fill:", _row(self._point_alpha,
+                                            self._point_fill))
+
+        self._point_stroke = _spin(0.0, 3.0, 0.1)
+        self._point_stroke.setToolTip(
+            "Outline weight around each point. 0 = no outline — the marker is "
+            "drawn solid in the curve colour. Only the filled shapes can show "
+            "one; a stroke on '+' or 'x' is just a thicker mark.")
+        self._point_stroke_color = ColorButton("#000000", auto_text="curve")
+        form.addRow("Outline:", _row(self._point_stroke,
+                                     self._point_stroke_color))
+
+        # ---- censor ticks -------------------------------------------------
+        self._censor_ticks = QCheckBox("Censor ticks")
+        form.addRow("", self._censor_ticks)
+        self._censor_shape = _combo(pf.POINT_SHAPES)
+        self._censor_size = _spin(0.2, 12.0, 0.2)
+        self._censor_color = ColorButton("", auto_text="curve")
+        form.addRow("Tick shape/size:", _row(self._censor_shape,
+                                             self._censor_size,
+                                             self._censor_color))
+
+        # ---- confidence band ---------------------------------------------
+        self._ci_band = QCheckBox("95% CI bands")
+        form.addRow("", self._ci_band)
+        self._ci_alpha = _spin(0.0, 1.0, 0.05, 2)
+        form.addRow("Band opacity:", self._ci_alpha)
+
+        card.add_body(form)
+        return card
+
+    def _build_panels_card(self) -> Card:
+        card = Card("Panels & legend", Category.PLOTS, icon_name="plots",
+                    subtitle="Backgrounds, borders, facet strips, gridlines "
+                             "and the at-risk band.")
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self._panel_bg = ColorButton("", auto_text="theme")
+        self._panel_border = QCheckBox("Border")
+        form.addRow("Panel:", _row(self._panel_bg, self._panel_border))
+
+        self._grid = _combo(("none", "y", "both"))
+        self._grid.setToolTip(
+            "Off by default: a survivorship curve is read against its own "
+            "steps, and rules at 0.25/0.5/0.75 compete with them.")
+        form.addRow("Gridlines:", self._grid)
+
+        self._strip_style = _combo(("plain", "boxed"))
+        self._strip_bg = ColorButton("#d9d9d9")
+        form.addRow("Facet strips:", _row(self._strip_style, self._strip_bg))
+
+        self._legend_pos = _combo(("right", "left", "top", "bottom", "none"))
+        form.addRow("Legend:", self._legend_pos)
+
+        self._risk_table = QCheckBox("At-risk band below the curves")
+        form.addRow("", self._risk_table)
+        self._risk_font_size = _spin(3, 20, 0.5)
+        self._risk_row_height = _spin(0.02, 0.4, 0.005, 3)
+        form.addRow("Band size:", _row(self._risk_font_size,
+                                       QLabel("  row:"),
+                                       self._risk_row_height))
+        self._risk_times = QLineEdit()
+        self._risk_times.setPlaceholderText("auto — e.g. 0, 20, 40, 60")
+        self._risk_times.setToolTip(
+            "The times the counts are printed at. Empty spreads them evenly "
+            "across the observed range; a list pins them, which is what a "
+            "figure beside another one needs.")
+        self._risk_times.editingFinished.connect(self._refresh_preview)
+        form.addRow("Band times:", self._risk_times)
+
+        card.add_body(form)
+        return card
+
+    def _build_colours_card(self) -> Card:
+        """One swatch per curve in the current figure, plus the fallback cycle.
+
+        Rebuilt whenever the figure changes, because the curves are a property
+        of the data and the Spec's treatment list — not of the Style, which is
+        shared and may be used by a member with different treatments.
+        """
+        card = Card("Colours", Category.PLOTS, icon_name="figures",
+                    subtitle="Per-curve assignments, then the cycle anything "
+                             "unassigned falls back to.")
+        self._series_form = QFormLayout()
+        self._series_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self._series_swatches: dict[str, ColorButton] = {}
+        card.add_body(self._series_form)
+
+        self._cycle_row = QHBoxLayout()
+        self._cycle_row.setSpacing(4)
+        self._cycle_swatches: list[ColorButton] = []
+        holder = QWidget()
+        holder.setLayout(self._cycle_row)
+        holder.setToolTip(
+            "The cycle a curve with no explicit colour takes, in order — so a "
+            "style can carry a journal's palette without naming every "
+            "treatment in advance.")
+        card.add_body(QLabel("Fallback cycle:"))
+        card.add_body(holder)
+
+        reset = QPushButton("Reset curve colours to the cycle")
+        reset.setToolTip("Clear every per-curve assignment. The cycle itself "
+                         "is left alone.")
+        reset.clicked.connect(self._reset_series_colours)
+        card.add_body(reset)
 
         row = QHBoxLayout()
-        refresh = ActionButton("Refresh preview", Category.PLOTS, icon_name="refresh")
+        refresh = ActionButton("Refresh preview", Category.PLOTS,
+                               icon_name="refresh")
         refresh.clicked.connect(self._refresh_preview)
         row.addWidget(refresh)
         card.add_body(row)
         return card
+
+    # ── colours ────────────────────────────────────────────────────────────
+
+    def _series_labels(self) -> list[str]:
+        """The curve labels the current figure will draw, in plot order."""
+        spec = self.spec
+        if spec is None or self._lifetables is None:
+            return []
+        try:
+            data = pf.curve_data(self._lifetables, spec)
+        except Exception:  # noqa: BLE001 - the preview reports it; not here
+            return []
+        if data.empty:
+            return []
+        col = "_series" if "_series" in data.columns else "label"
+        return list(dict.fromkeys(data[col]))
+
+    def _rebuild_colour_controls(self) -> None:
+        while self._series_form.rowCount():
+            self._series_form.removeRow(0)
+        self._series_swatches = {}
+        style = self.style
+        labels = self._series_labels()
+        cycle = list(style.palette_cycle or pf.DEFAULT_PALETTE)
+        for i, label in enumerate(labels):
+            ## What this curve would be WITHOUT an explicit assignment. Kept
+            ## on the swatch so harvest can tell "the user picked this" from
+            ## "the cycle happened to give this" — without it, opening the
+            ## editor and touching anything would pin every curve's colour
+            ## into the shared Style and the cycle would stop meaning
+            ## anything.
+            auto = cycle[i % len(cycle)] if cycle else pf.DEFAULT_PALETTE[0]
+            swatch = ColorButton(style.palette.get(label) or auto)
+            swatch.setProperty("auto_colour", auto)
+            swatch.changed.connect(self._refresh_preview)
+            self._series_swatches[label] = swatch
+            self._series_form.addRow(f"{label}:", swatch)
+        if not labels:
+            self._series_form.addRow(
+                "", QLabel("No curves yet — check the figure's settings."))
+
+        while self._cycle_row.count():
+            item = self._cycle_row.takeAt(0)
+            if item.widget() is not None:
+                item.widget().setParent(None)
+        self._cycle_swatches = []
+        cycle = list(style.palette_cycle or pf.DEFAULT_PALETTE)
+        for colour in cycle:
+            swatch = ColorButton(colour)
+            swatch.setFixedSize(24, 20)
+            swatch.changed.connect(self._refresh_preview)
+            self._cycle_swatches.append(swatch)
+            self._cycle_row.addWidget(swatch)
+        self._cycle_row.addStretch(1)
+
+    def _reset_series_colours(self) -> None:
+        self.style.palette = {}
+        self._rebuild_colour_controls()
+        self._refresh_preview()
 
     # ── state <-> form ─────────────────────────────────────────────────────
 
@@ -238,26 +596,82 @@ class PlotEditorWindow(QMainWindow):
         self._style_combo.blockSignals(False)
         self._load_style_into_form()
 
+    #: form attribute -> style field, for the three kinds of control that
+    #: round-trip mechanically. Written once so load and harvest cannot
+    #: disagree about which widget owns which field — the failure mode when
+    #: a style has thirty of them is a control that silently does nothing.
+    _NUMBERS = (
+        ("_width", "width_mm"), ("_height", "height_mm"),
+        ("_base_size", "base_size"), ("_title_pt", "title_pt"),
+        ("_axis_title_pt", "axis_title_pt"), ("_tick_pt", "tick_pt"),
+        ("_legend_pt", "legend_pt"), ("_strip_pt", "strip_pt"),
+        ("_line_width", "line_width"), ("_line_pt", "line_pt"),
+        ("_point_size", "point_size"), ("_point_alpha", "point_alpha"),
+        ("_point_stroke", "point_stroke"), ("_censor_size", "censor_size"),
+        ("_ci_alpha", "ci_alpha"), ("_risk_font_size", "risk_font_size"),
+        ("_risk_row_height", "risk_row_height"),
+    )
+    _FLAGS = (
+        ("_show_points", "show_points"), ("_censor_ticks", "censor_ticks"),
+        ("_ci_band", "ci_band"), ("_risk_table", "risk_table"),
+        ("_panel_border", "panel_border"),
+    )
+    _CHOICES = (
+        ("_theme_combo", "theme"), ("_legend_pos", "legend_position"),
+        ("_point_at", "point_at"), ("_point_shape", "point_shape"),
+        ("_censor_shape", "censor_shape"), ("_grid", "grid"),
+        ("_strip_style", "strip_style"),
+    )
+    _COLOURS = (
+        ("_text_color", "text_color"), ("_point_fill", "point_fill"),
+        ("_point_stroke_color", "point_stroke_color"),
+        ("_censor_color", "censor_color"), ("_panel_bg", "panel_bg"),
+        ("_strip_bg", "strip_bg"),
+    )
+
+    def _connect_style_controls(self) -> None:
+        """Every style control re-renders. One place, so a control added to a
+        card is never left inert."""
+        for attr, _field in self._NUMBERS:
+            getattr(self, attr).valueChanged.connect(self._refresh_preview)
+        for attr, _field in self._FLAGS:
+            getattr(self, attr).stateChanged.connect(self._refresh_preview)
+        for attr, _field in self._CHOICES:
+            getattr(self, attr).currentTextChanged.connect(self._refresh_preview)
+        for attr, _field in self._COLOURS:
+            getattr(self, attr).changed.connect(self._refresh_preview)
+        self._font_combo.currentFontChanged.connect(self._refresh_preview)
+
     def _load_style_into_form(self) -> None:
         style = self.style
-        for widget, value in ((self._width, style.width_mm),
-                              (self._height, style.height_mm),
-                              (self._base_size, style.base_size),
-                              (self._line_width, style.line_width)):
+        for attr, field_name in self._NUMBERS:
+            widget = getattr(self, attr)
             widget.blockSignals(True)
-            widget.setValue(float(value))
+            widget.setValue(float(getattr(style, field_name)))
             widget.blockSignals(False)
-        for widget, value in ((self._censor_ticks, style.censor_ticks),
-                              (self._ci_band, style.ci_band),
-                              (self._risk_table, style.risk_table)):
+        for attr, field_name in self._FLAGS:
+            widget = getattr(self, attr)
             widget.blockSignals(True)
-            widget.setChecked(bool(value))
+            widget.setChecked(bool(getattr(style, field_name)))
             widget.blockSignals(False)
-        for combo, value in ((self._theme_combo, style.theme),
-                             (self._legend_pos, style.legend_position)):
-            combo.blockSignals(True)
-            combo.setCurrentText(value)
-            combo.blockSignals(False)
+        for attr, field_name in self._CHOICES:
+            widget = getattr(self, attr)
+            widget.blockSignals(True)
+            widget.setCurrentText(str(getattr(style, field_name)))
+            widget.blockSignals(False)
+        for attr, field_name in self._COLOURS:
+            widget = getattr(self, attr)
+            widget.blockSignals(True)
+            widget.set_color(str(getattr(style, field_name)))
+            widget.blockSignals(False)
+        self._font_combo.blockSignals(True)
+        self._font_combo.setCurrentFont(QFont(style.font_family))
+        self._font_combo.blockSignals(False)
+        self._risk_times.blockSignals(True)
+        self._risk_times.setText(", ".join(
+            _fmt_number(t) for t in (style.risk_table_times or [])))
+        self._risk_times.blockSignals(False)
+        self._rebuild_colour_controls()
 
     def _harvest(self) -> tuple[pf.PlotSpec, pf.PlotStyle]:
         """Read the form back into the live Spec and Style objects."""
@@ -272,15 +686,29 @@ class PlotEditorWindow(QMainWindow):
             ref = self._reference_line.value()
             spec.reference_line = None if ref <= -0.999 else ref
             spec.style = self._style_combo.currentText()
-        style.width_mm = self._width.value()
-        style.height_mm = self._height.value()
-        style.theme = self._theme_combo.currentText()
-        style.base_size = self._base_size.value()
-        style.line_width = self._line_width.value()
-        style.censor_ticks = self._censor_ticks.isChecked()
-        style.ci_band = self._ci_band.isChecked()
-        style.risk_table = self._risk_table.isChecked()
-        style.legend_position = self._legend_pos.currentText()
+        for attr, field_name in self._NUMBERS:
+            setattr(style, field_name, getattr(self, attr).value())
+        for attr, field_name in self._FLAGS:
+            setattr(style, field_name, getattr(self, attr).isChecked())
+        for attr, field_name in self._CHOICES:
+            setattr(style, field_name, getattr(self, attr).currentText())
+        for attr, field_name in self._COLOURS:
+            setattr(style, field_name, getattr(self, attr).color())
+        style.font_family = self._font_combo.currentFont().family()
+        style.risk_table_times = _parse_numbers(self._risk_times.text())
+        ## Only the curves actually on screen are written back, so opening a
+        ## member with fewer treatments never drops another member's colours
+        ## from a shared Style. And only the ones that deviate: `palette` means
+        ## "explicitly assigned", so a swatch still showing its cycle colour is
+        ## removed rather than pinned.
+        for label, swatch in self._series_swatches.items():
+            colour = swatch.color()
+            if colour and colour != swatch.property("auto_colour"):
+                style.palette[label] = colour
+            else:
+                style.palette.pop(label, None)
+        if self._cycle_swatches:
+            style.palette_cycle = [s.color() for s in self._cycle_swatches]
         return spec, style
 
     # ── preview ────────────────────────────────────────────────────────────
@@ -294,6 +722,31 @@ class PlotEditorWindow(QMainWindow):
         self._load_style_into_form()
         self._refresh_preview()
 
+    def _preview_dpi(self, style) -> int:
+        """The DPI that fills the preview widget exactly, in **device** pixels.
+
+        A Publication Figure is sized in millimetres, so its pixel size is a
+        function of DPI alone. Rendering at a fixed 110 gave a 519x389 raster
+        for the default 120x90mm style — smaller than the preview widget has
+        ever been — and Qt then upscaled it, which is what made every preview
+        soft. Rasterising is not what costs the time here (the plotnine build
+        is ~110ms whatever the DPI), so there is nothing to buy by rendering
+        small.
+
+        The device pixel ratio is part of the sum: on a HiDPI screen the
+        widget's logical size is half of what actually gets painted, so a
+        raster matched to the logical size is upscaled twice over.
+        """
+        ratio = self._preview.devicePixelRatioF()
+        width_in = max(float(style.width_mm), 1.0) / 25.4
+        height_in = max(float(style.height_mm), 1.0) / 25.4
+        size = self._preview.size()
+        ## KeepAspectRatio fits whichever axis is more constrained, so that is
+        ## the axis that decides the resolution.
+        dpi = min(size.width() * ratio / width_in,
+                  size.height() * ratio / height_in)
+        return int(max(_PREVIEW_MIN_DPI, min(_PREVIEW_MAX_DPI, dpi)))
+
     def _refresh_preview(self) -> None:
         spec, style = self._harvest()
         if spec is None:
@@ -302,17 +755,47 @@ class PlotEditorWindow(QMainWindow):
         try:
             if self._lifetables is None:
                 self._lifetables = pf._load_lifetables(self.experiment)
+            ## The curves are a property of the DATA and the Spec, so they are
+            ## not known until the lifetables are read — which happens here,
+            ## after the form was first built. Rebuild when the set changes
+            ## (first render, and any Spec edit that adds or drops a curve).
+            if set(self._series_swatches) != set(self._series_labels()):
+                self._rebuild_colour_controls()
+                spec, style = self._harvest()
             g = pf.build_ggplot(pf.curve_data(self._lifetables, spec), spec, style)
-            data = pf.render_png_bytes(g, style)
+            data = pf.render_png_bytes(g, style, dpi=self._preview_dpi(style))
         except Exception as exc:  # noqa: BLE001 - a bad spec shows, never crashes
             self._preview.setText(f"Preview failed:\n{exc}")
             self._log.append_line(f"Preview failed: {exc}")
             return
+        ratio = self._preview.devicePixelRatioF()
         pixmap = QPixmap()
         pixmap.loadFromData(data)
-        self._preview.setPixmap(pixmap.scaled(
-            self._preview.size(), Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation))
+        ## The raster is in device pixels, so say so. Without this Qt reads it
+        ## as logical pixels and paints it at ratio x, undoing the resolution
+        ## it was just given.
+        pixmap.setDevicePixelRatio(ratio)
+        ## Downscale only. Scaling up is the thing being fixed: when the DPI
+        ## ceiling bites (a very large window), a figure shown a little under
+        ## the widget's size is better than a blurred one filling it.
+        target = self._preview.size() * ratio
+        if (pixmap.width() > target.width()
+                or pixmap.height() > target.height()):
+            pixmap = pixmap.scaled(
+                target, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+            pixmap.setDevicePixelRatio(ratio)
+        self._preview.setPixmap(pixmap)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        """Re-render, do not rescale: the preview's resolution is chosen from
+        the widget's size, so a resize changes what "sharp" means.
+
+        Debounced, because a window drag emits one resize per frame and each
+        one would otherwise rebuild the figure.
+        """
+        super().resizeEvent(event)
+        self._resize_timer.start(150)
 
     # ── saving ─────────────────────────────────────────────────────────────
 

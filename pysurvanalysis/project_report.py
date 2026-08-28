@@ -256,7 +256,9 @@ def build_project_report(project, narrative: dict[str, str] | None = None) -> m.
 
     for member in project.members():
         s = saved[member.name]
-        report.add(m.PageBreak())
+        ## No PageBreak of its own: a SectionDivider already starts on a
+        ## fresh page, and asking for one here put an empty page — header and
+        ## footer only — in front of every member.
         report.add(m.SectionDivider(member.name,
                                     subtitle=member.type.label))
         if not s.exists:

@@ -133,13 +133,35 @@ class Project:
         )
 
     def candidate_dirs(self) -> list[Path]:
-        """Subdirectories that could become members but hold no config yet."""
-        skip = {"analysis", "qc", "data", "figures", "__pycache__"}
-        return sorted(
-            d for d in self.directory.iterdir()
-            if d.is_dir() and not cfgmod.is_experiment_dir(d)
-            and d.name not in skip and not d.name.startswith(".")
-        )
+        """Subdirectories that could become members but hold no config yet.
+
+        One walk, not two: :func:`layout.initializable_dirs` answers exactly
+        this question for the Hub's *Initialize existing directory…* picker,
+        and a second implementation here would be free to disagree with the
+        picker about what the Project can still adopt.
+        """
+        from . import layout as layout_mod
+
+        return [item.directory for item in
+                layout_mod.initializable_dirs(self.directory)]
+
+    def unconfigured_dirs(self) -> list[str]:
+        """Names of :meth:`candidate_dirs` — the third state a folder can be
+        in, and the one the members table cannot show by itself."""
+        return [d.name for d in self.candidate_dirs()]
+
+    def member_dir(self, name: str) -> Path:
+        """Where a member of this Project called *name* would live.
+
+        *name* is joined onto the Project directory, so it must be a single
+        folder name: a separator or a ``..`` in it would place the member —
+        and its ``data/`` — outside the Project entirely.
+        """
+        if not name or name != Path(name).name or name in (".", ".."):
+            raise ProjectError(
+                f"{name!r} is not a member name — it must be a single folder "
+                f"name inside the project.")
+        return self.directory / name
 
     def members(self, reload: bool = False) -> list[SurvivalExperiment]:
         if self._members is None or reload:
@@ -190,6 +212,41 @@ class Project:
                 )
             problems.extend(f"{member.name}: {p}" for p in member.validate())
         return problems
+
+    def type_problems_for(self, config: dict, label: str = "config") -> list[str]:
+        """Why *config* could not be a member of this Project (empty = it can).
+
+        Exactly one rule, and the same one :meth:`validate` enforces every
+        time the Project loads (ADR-0001): a member must share the Project's
+        Experiment Type. Differing factors, levels and censoring policy are
+        **Divergence** — legal, declared on the report — so they are not
+        checked here; refusing them would enforce a uniformity this Project
+        deliberately does not have.
+
+        Nor are ordinary config problems: an unusable ``input.format`` makes a
+        member fail, but it does not stop the *Project* loading, so it is
+        something to report after the write rather than grounds to refuse one.
+        This answers "can this be a member", and nothing else.
+
+        Used before a config is copied over a scaffold, so a file that would
+        make the Project refuse to load is never written in the first place.
+        """
+        from ..experiment_types import type_for_config
+
+        try:
+            expected = self.type
+        except ValueError as exc:
+            return [f"this Project's own type is unusable: {exc}"]
+        try:
+            actual = type_for_config(config)
+        except ValueError as exc:
+            return [f"{label}: {exc}"]
+        if actual.key != expected.key:
+            return [f"{label} is a {actual.label} but the Project's type is "
+                    f"{expected.label}. Every Member Experiment must share it "
+                    f"— the type selects the analyses, the Plot Set and the "
+                    f"report sections."]
+        return []
 
     def divergences(self) -> list[Divergence]:
         """Where members differ — declared on the Project Report, never fatal."""
@@ -433,11 +490,7 @@ class Project:
         the Project directory, so a separator or a ``..`` in it would write a
         config — and a ``data/`` folder — outside the Project entirely.
         """
-        if not name or name != Path(name).name or name in (".", ".."):
-            raise ProjectError(
-                f"{name!r} is not a member name — it must be a single folder "
-                f"name inside the project.")
-        d = self.directory / name
+        d = self.member_dir(name)
         d.mkdir(parents=True, exist_ok=True)
         if not cfgmod.is_experiment_dir(d):
             body = dict(config or {})

@@ -40,6 +40,18 @@ from . import config as cfgmod
 #: as a candidate member.
 _NOT_MEMBERS = {"data", "analysis", "qc", "figures", "__pycache__"}
 
+#: Output directories written beside a report, named for it (``<stem>_figures``
+#: from the markdown backend). Matched by suffix rather than listed, because
+#: the stem is the report's and so varies with the Project — and a Project that
+#: has been reported on once would otherwise offer its own figure dump as a
+#: directory to initialize as a member.
+_OUTPUT_SUFFIXES = ("_figures",)
+
+
+def _is_output_dir(name: str) -> bool:
+    lowered = name.lower()
+    return lowered in _NOT_MEMBERS or lowered.endswith(_OUTPUT_SUFFIXES)
+
 # Status values. The empty string is "not experiment-shaped at all", which is
 # not a problem to report — most subdirectories of anything are not.
 NOT_AN_EXPERIMENT = ""
@@ -233,7 +245,7 @@ def members_in(project_dir: Path | str) -> list[MemberLayout]:
             continue
         if not os.path.isdir(path):
             continue
-        if path.name.lower() in _NOT_MEMBERS and not has_config(path):
+        if _is_output_dir(path.name) and not has_config(path):
             continue
         real = os.path.realpath(path)
         if real in seen:
@@ -242,4 +254,41 @@ def members_in(project_dir: Path | str) -> list[MemberLayout]:
         item = classify(path)
         if item.status != NOT_AN_EXPERIMENT:
             found.append(item)
+    return found
+
+
+def initializable_dirs(project_dir: Path | str) -> list[MemberLayout]:
+    """Immediate subdirectories of *project_dir* that hold no config yet.
+
+    The candidates for "initialize this existing directory as a member".
+    :func:`members_in` answers the narrower question "what is already
+    experiment-shaped", and a folder somebody made and has not filled yet
+    answers it *no* — which is exactly the folder that needs initializing, so
+    it must not be invisible here for want of being a member already.
+
+    Output directories are excluded by name, as there; a directory that
+    already carries a ``survival_config.yaml`` is a member and has nothing
+    left to initialize.
+    """
+    project_dir = Path(project_dir)
+    found: list[MemberLayout] = []
+    seen: set[str] = set()
+    try:
+        entries = sorted(project_dir.iterdir(), key=lambda p: p.name)
+    except OSError:
+        return []
+    for path in entries:
+        if path.name.startswith("."):
+            continue
+        if not os.path.isdir(path):
+            continue
+        if _is_output_dir(path.name):
+            continue
+        if has_config(path):
+            continue
+        real = os.path.realpath(path)
+        if real in seen:
+            continue
+        seen.add(real)
+        found.append(classify(path))
     return found

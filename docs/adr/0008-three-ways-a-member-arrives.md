@@ -37,3 +37,13 @@ directory that arrives with its own `survival_config.yaml` keeps it untouched.
 
 Adoption never overwrites: a destination that already exists is an error
 naming it, not a merge.
+
+## Amended by [ADR-0010](0010-three-states-not-three-origins.md)
+
+Two of these three still stand as written. **Create directory** was never
+really an origin — "there is no folder yet" is a *state* — so it is now called
+**Create experiment…** and sits with the other two state buttons, where it
+refuses a name whose folder already exists instead of adopting whatever is in
+it. **Add directory** and **Add experiment** are unchanged, and keep their
+place on the card under a divider: they are the two ways in from *outside* the
+Project, and everything above the divider stays inside it.

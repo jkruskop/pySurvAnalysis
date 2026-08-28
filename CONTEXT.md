@@ -80,10 +80,15 @@ implies pooling)
 **Member Experiment**:
 An Experiment that belongs to a Project — analyzed entirely on its own,
 related to its siblings by the *question* they address rather than by an
-identical design. One arrives three ways (ADR-0008): an existing directory
-adopted (copied in unless it is already a child), an empty one scaffolded, or
-one built around a single DLife workbook (moved in if it was already loose in
-the Project tree, copied otherwise).
+identical design. The Hub's Experiments card offers five ways to get one,
+answering two different questions (ADR-0010). **What state is the folder in?**
+— it does not exist (**Create experiment…**), its directory is in the Project
+but has no config (**Initialize existing directory…**), or it is a member
+already (the table, and **Experiment configs…** for the bulk view). **Where
+does it come from?** — ADR-0008's two ways in from outside: an existing
+directory adopted (copied in unless it is already a child), or one built
+around a single DLife workbook (moved in if it was already loose in the
+Project tree, copied otherwise).
 _Avoid_: replicate (implies same-design repeats and pooling — the very thing
 this app does not do), arm, variant
 
@@ -148,13 +153,26 @@ _Avoid_: main plot, key figure
 **Publication Figure**:
 A hand-curated, journal-ready vector figure (SVG with editable text, or PDF)
 rendered by plotnine from a Plot Spec + Plot Style — distinct from the
-matplotlib figures the Hub previews and the QC Viewer draws.
+matplotlib figures the Hub previews and the QC Viewer draws. It is **authored
+in the Plot Editor and rendered from the Project panel**, and nowhere else:
+a Spec belongs to one experiment (ADR-0005), while rendering walks every
+member, so the two actions have different subjects and do not share a card.
+The Plots tile holds only the Type Actions the loaded Experiment Type
+contributes.
 _Avoid_: report figure, plot export
 
 **Plot Style**:
-A named, reusable look shared by every Publication Figure that references it:
-figure size, theme, fonts, curve and censor-tick styling, whether the
-at-risk band is drawn and at which times, and the treatment→colour mapping.
+A named, reusable look shared by every Publication Figure that references it,
+edited in the Plot Editor's four style cards: **canvas and type** (size,
+theme, font family, base size, a per-element point size for title / axis
+titles / ticks / legend / strips, and one text colour for all of them),
+**curves and points** (curve width, the separate weight of the axis
+furniture, markers on the curve with their shape, size, opacity, fill and
+outline, censor ticks, the confidence band), **panels and legend** (panel
+fill and border, gridlines, facet-strip style and fill, legend position, the
+At-Risk Band's size and times), and **colours** (a per-curve assignment, over
+a fallback cycle). Every per-element size defaults to 0 = *follow the base*,
+so a style that sets only `base_size` still scales as one thing.
 _Avoid_: theme (a plotnine theme is one field inside a style)
 
 **Plot Spec**:
@@ -179,7 +197,10 @@ area below. All controls live in a tile's anchored panel, one open at a time.
 The Analyze tile's cards are contributed by the loaded experiment's
 **Experiment Type**. The selection names the working container — a Batch, a
 Project, or a standalone Experiment Directory; a Member Experiment is loaded
-by double-clicking its row in the Project panel's members table.
+by double-clicking its row in the Project panel's members table. The Project
+panel is three cards deep: **Create/Load** (the ways into a Project, plus
+Validate YAMLs), **Experiments** (the members table and the ways to make one),
+and **Actions** (report, view, plot editor) over the Project **Scripts** card.
 _Avoid_: sidebar card column (the pre-overhaul layout), Load tile (absorbed:
 input format, time/event columns and censoring policy now live in
 `survival_config.yaml`)
@@ -269,6 +290,17 @@ The DLife convention that individuals unaccounted for at the end of a census
 are treated as right-censored rather than dead. A per-experiment policy, set by
 the Experiment Type's default and overridable in `survival_config.yaml`.
 
+**Initialize**:
+Give a directory that already exists the marker file that makes it a Project
+or a Member Experiment, keeping its own name and contents — `project.yaml` at
+the Project level, `survival_config.yaml` one level down. The third of the
+three states a folder can be in (ADR-0010): **Open** wants the marker already
+there, **Create** makes the directory too, and Initialize is the one for a
+directory you already have. Distinct from **Upgrade**, which rewrites an old
+*layout* into the current one; initializing writes a marker and moves nothing.
+_Avoid_: adopt (reserved for ADR-0008's two ways a member arrives from
+outside the Project, which copy or move data), convert, import
+
 **Upgrade**:
 The non-destructive conversion of a pre-overhaul directory into an Experiment
 Directory: offered on open and available in Tools, it writes
@@ -287,7 +319,8 @@ re-analysing, which is what makes a bound Project Report cheap and what makes
 _Avoid_: cache, manifest
 
 **Minimal Member Config**:
-What `Add member` writes: the least a Member Experiment must state itself,
+What **Create experiment…** writes: the least a Member Experiment must state
+itself,
 with everything the Project's `defaults:` supplies left out. A member that
 restates a default freezes it — later edits to the Project stop reaching that
 member — so scaffolds stay minimal on purpose.

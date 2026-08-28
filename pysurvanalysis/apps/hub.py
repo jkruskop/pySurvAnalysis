@@ -67,7 +67,6 @@ from ..domain import (
     layout as layout_mod,
     upgrade as upgrade_mod,
 )
-from ..experiment_types import available_types
 from ..script_editor.project_actions import DEFAULT_PROJECT_SCRIPT_NAME
 from ..ui import (
     ActionButton,
@@ -294,42 +293,176 @@ class HubWindow(QMainWindow):
         self._panels["batch"].add_card(card)
 
     def _build_project_panel(self) -> None:
-        card = Card("Project", Category.NEUTRAL, icon_name="project",
-                    subtitle="Double-click a member to load it.")
-        ## Open and Create lead the card: opening or making a Project is the
-        ## first thing anyone does here, so they sit above the members grid.
-        row = QHBoxLayout()
-        open_btn = QPushButton(icon("open"), " Open project…")
+        """Three cards: the ways into a Project, the members themselves, and
+        what you do with a Project once its members exist.
+
+        Both action sets are laid out the same way and for the same reason:
+        a folder is in one of three states before it is a Project (or a
+        member), and each state has its own button. Mirrors the sister app's
+        Create/Load and Experiments cards one concept at a time; where a
+        button here has no counterpart there, it is one of ADR-0008's ways a
+        member arrives from outside the Project.
+        """
+        card = Card("Create/Load", Category.NEUTRAL, icon_name="project",
+                    subtitle="Open a Project directory and edit its project.yaml.")
+        self._project_create_card = card
+
+        ## Two columns, four buttons, no ragged row: the three states a folder
+        ## can be in — it is a Project, it does not exist at all, or its
+        ## directory exists but its project.yaml does not — then the editor
+        ## for the one that is open.
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
+        open_btn = ActionButton("Open project…", Category.NEUTRAL,
+                                icon_name="open")
+        open_btn.setToolTip(
+            "Open a directory that already holds a project.yaml. Picking the "
+            "one already open re-reads it from disk, so members added or "
+            "analysed outside the Hub show up — the picker is the reload. It "
+            "also takes a Batch folder or a standalone Experiment Directory, "
+            "which a Project is never required for (ADR-0003).")
         open_btn.clicked.connect(self._pick_directory)
-        create = QPushButton(icon("new"), " Create project…")
-        create.clicked.connect(self._action_create_project)
-        row.addWidget(open_btn)
-        row.addWidget(create)
-        card.add_body(row)
+        create_btn = ActionButton("Create project…", Category.NEUTRAL,
+                                  icon_name="new")
+        create_btn.setToolTip(
+            "Make a Project that does not exist yet: choose where it goes, "
+            "name it, and fill in its question and defaults. The directory is "
+            "created for you.")
+        create_btn.clicked.connect(self._action_create_project)
+        init_btn = ActionButton("Initialize existing directory…",
+                                Category.NEUTRAL, icon_name="project")
+        init_btn.setToolTip(
+            "Turn a directory you already have into a Project: it keeps its "
+            "own name, any experiment subdirectories already in it become the "
+            "members, and project.yaml is written there. The path for a study "
+            "that started before there were Projects.")
+        init_btn.clicked.connect(self._action_initialize_project)
+        self._btn_edit_project_cfg = ActionButton(
+            "Edit config…", Category.NEUTRAL, icon_name="config")
+        self._btn_edit_project_cfg.setToolTip(
+            "Open the Project editor on the open Project's project.yaml — its "
+            "name, question, Experiment Type and Project Defaults. Giving a "
+            "directory its first project.yaml is 'Initialize existing "
+            "directory…', not this.")
+        self._btn_edit_project_cfg.setEnabled(False)
+        self._btn_edit_project_cfg.clicked.connect(
+            self._action_edit_project_config)
+        for i, btn in enumerate((open_btn, create_btn, init_btn,
+                                 self._btn_edit_project_cfg)):
+            grid.addWidget(btn, i // 2, i % 2)
+        ## Full width on its own row: not a fifth way in, but the check you
+        ## run over the Project that is open.
+        validate_btn = ActionButton("Validate YAMLs", Category.NEUTRAL,
+                                    icon_name="validate")
+        validate_btn.setToolTip(
+            "Check the Project's project.yaml and every member's "
+            "survival_config.yaml — parse errors and semantic problems alike. "
+            "Validating only the loaded member left the rest of a Project "
+            "unchecked, which is exactly where a type mismatch hides.")
+        validate_btn.clicked.connect(self._action_validate_project)
+        grid.addWidget(validate_btn, 2, 0, 1, 2)
+        for col in range(2):
+            grid.setColumnStretch(col, 1)
+        card.add_body(grid)
 
-        self._members_table = self._make_table(
-            ["Member", "Type", "N", "Analysed", "Exclusions"])
-        self._members_table.doubleClicked.connect(self._on_member_double_clicked)
-        card.add_body(self._members_table)
-
-        ## Three ways in, because members arrive three ways: an existing
-        ## experiment folder, an empty one to fill, or a bare workbook.
-        row = QHBoxLayout()
-        adopt_dir = QPushButton(icon("open"), " Add directory…")
-        adopt_dir.setToolTip("Take an existing experiment directory (with a "
-                             "data/ folder) into this Project.")
-        adopt_dir.clicked.connect(self._action_add_directory)
-        create_dir = QPushButton(icon("add"), " Create directory…")
-        create_dir.setToolTip("Scaffold an empty member: a data/ folder and a "
-                              "default config from the Project's type.")
-        create_dir.clicked.connect(self._action_add_member)
-        adopt_file = QPushButton(icon("excel"), " Add experiment…")
-        adopt_file.setToolTip("Build a member around one DLife workbook.")
-        adopt_file.clicked.connect(self._action_add_experiment)
-        for btn in (adopt_dir, create_dir, adopt_file):
-            row.addWidget(btn)
-        card.add_body(row)
+        ## What is loaded, described: name, type, member count, divergences and
+        ## any load problems. Project information, so it sits with the Project
+        ## it describes rather than over the members table.
+        self._project_summary = QLabel("")
+        self._project_summary.setWordWrap(True)
+        card.add_body(self._project_summary)
         self._panels["project"].add_card(card)
+
+        # ---- the members themselves ----------------------------------------
+        members_card = Card("Experiments", Category.NEUTRAL,
+                            icon_name="experiment",
+                            subtitle="Double-click a member to load it.")
+        self._project_members_card = members_card
+        self._members_table = self._make_table(
+            ["Member", "Config", "Type", "N", "Analysed", "Exclusions"])
+        self._members_table.doubleClicked.connect(self._on_member_double_clicked)
+        members_card.add_body(self._members_table)
+        hint = QLabel("A row marked Config: missing is a folder with no "
+                      "survival_config.yaml — double-click it to scaffold one.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: palette(mid); font-style: italic;")
+        members_card.add_body(hint)
+
+        ## The same three states as the card above, one level down: the member
+        ## exists (the table), it does not exist at all (Create), or its
+        ## directory exists but its config does not (Initialize).
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
+        create_exp = ActionButton("Create experiment…", Category.NEUTRAL,
+                                  icon_name="add")
+        create_exp.setToolTip(
+            "Create a member directory and scaffold its survival_config.yaml "
+            "from the Project Defaults. The scaffold stays minimal, so later "
+            "edits to the Project keep reaching it.")
+        create_exp.clicked.connect(self._action_create_experiment)
+        init_exp = ActionButton("Initialize existing directory…",
+                                Category.NEUTRAL, icon_name="project")
+        init_exp.setToolTip(
+            "Adopt a directory that is already in the Project but has no "
+            "survival_config.yaml: the config is scaffolded from the Project "
+            "Defaults, and a directory holding several candidate data files "
+            "is asked which one is the experiment.")
+        init_exp.clicked.connect(self._action_initialize_experiment)
+        configs_btn = ActionButton("Experiment configs…", Category.NEUTRAL,
+                                   icon_name="config")
+        configs_btn.setToolTip(
+            "The bulk view: every subdirectory with its config and data "
+            "status, so the missing configs can be made and the ambiguous "
+            "ones settled without hunting through a file manager.")
+        configs_btn.clicked.connect(self._action_member_configs)
+        ## Two columns, like the card above and for the same reason: three of
+        ## these labels across a 540px panel do not fit, and the panel does
+        ## not scroll sideways — it clips. The two ways IN sit side by side,
+        ## and the bulk editor takes its own full-width row below them, where
+        ## Validate YAMLs sits on the Create/Load card.
+        for i, btn in enumerate((create_exp, init_exp)):
+            grid.addWidget(btn, 0, i)
+        grid.addWidget(configs_btn, 1, 0, 1, 2)
+        for col in range(2):
+            grid.setColumnStretch(col, 1)
+        members_card.add_body(grid)
+
+        ## ADR-0008's other two ways a member arrives, and the reason this card
+        ## has five buttons where the sister app's has three: there, replicates
+        ## are always made in place; here one can walk in from a collaborator's
+        ## drive or be a single loose workbook. Separated rather than mixed in,
+        ## because these two reach OUTSIDE the Project and the three above do
+        ## not.
+        members_card.add_section_label("Bring one in from outside")
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
+        adopt_dir = ActionButton("Add directory…", Category.NEUTRAL,
+                                 icon_name="open")
+        adopt_dir.setToolTip("Take an existing experiment directory (with a "
+                             "data/ folder) into this Project. One from "
+                             "outside is copied in — the Project owns its "
+                             "members' data.")
+        adopt_dir.clicked.connect(self._action_add_directory)
+        adopt_file = ActionButton("Add experiment…", Category.NEUTRAL,
+                                  icon_name="excel")
+        adopt_file.setToolTip("Build a member around one DLife workbook: it is "
+                              "named after the file, the file lands in its "
+                              "data/, and a minimal config is written.")
+        adopt_file.clicked.connect(self._action_add_experiment)
+        for i, btn in enumerate((adopt_dir, adopt_file)):
+            grid.addWidget(btn, 0, i)
+        for col in range(2):
+            grid.setColumnStretch(col, 1)
+        members_card.add_body(grid)
+
+        ## Nothing here has anything to inherit from until a Project is open.
+        self._member_action_buttons = [create_exp, init_exp, configs_btn,
+                                       adopt_dir, adopt_file]
+        self._set_member_actions_enabled(False)
+        self._panels["project"].add_card(members_card)
 
         actions_card = Card("Actions", Category.NEUTRAL, icon_name="report")
         self._project_actions_card = actions_card
@@ -339,8 +472,6 @@ class HubWindow(QMainWindow):
         ## identity already comes from the tile above it. Category colour is
         ## reserved for the panels where it distinguishes something: the
         ## type-contributed Analyze and Plots buttons, and Tools.
-        ## Two rows of two: these are peers, and a stack of full-width
-        ## buttons made small actions look like the main event.
         grid = QGridLayout()
         grid.setHorizontalSpacing(8)
         grid.setVerticalSpacing(8)
@@ -356,22 +487,44 @@ class HubWindow(QMainWindow):
                                 icon_name="pdf")
         view_btn.clicked.connect(self._action_view_reports)
         self._btn_view_reports = view_btn
-        validate_btn = ActionButton("Validate YAMLs", Category.NEUTRAL,
-                                    icon_name="validate")
-        validate_btn.setToolTip(
-            "Check the Project's project.yaml and every member's "
-            "survival_config.yaml — parse errors and semantic problems alike. "
-            "Validating only the loaded member left the rest of a Project "
-            "unchecked, which is exactly where a type mismatch hides.")
-        validate_btn.clicked.connect(self._action_validate_project)
         plots_btn = ActionButton("Plot editor…", Category.NEUTRAL,
                                  icon_name="plot")
+        plots_btn.setToolTip(
+            "Author Publication Figures: a member's Specs, and the Project's "
+            "shared Styles. Opens on the member selected in the table above "
+            "(or the loaded one); with several to choose from and none "
+            "picked, it asks which.")
         plots_btn.clicked.connect(self._action_open_plot_editor)
-        for i, btn in enumerate((report_btn, view_btn, validate_btn, plots_btn)):
-            grid.addWidget(btn, i // 2, i % 2)
-        for col in range(2):
+        for i, btn in enumerate((report_btn, view_btn, plots_btn)):
+            grid.addWidget(btn, 0, i)
+        for col in range(3):
             grid.setColumnStretch(col, 1)
         actions_card.add_body(grid)
+
+        ## Rendering is project-level: it walks every member. Paired with its
+        ## format on one row, the way the Scripts card pairs Run with the
+        ## script it runs.
+        row = QHBoxLayout()
+        self._fig_format = QComboBox()
+        self._fig_format.addItems(["svg", "pdf", "png"])
+        self._fig_format.setToolTip(
+            "svg and pdf keep text editable — the point of a publication "
+            "figure. png is for a slide.")
+        self._fig_format.setSizePolicy(QSizePolicy.Policy.Ignored,
+                                       QSizePolicy.Policy.Fixed)
+        render_btn = ActionButton("Render publication figures",
+                                  Category.NEUTRAL, icon_name="figures")
+        render_btn.setToolTip(
+            "Render every member's curated Publication Figures into its "
+            "figures/ folder. A member with no saved plots: in its "
+            "plot_specs.yaml is skipped and named, not rendered from the "
+            "Experiment Type's defaults — nobody asked for those (ADR-0005).")
+        render_btn.clicked.connect(self._action_render_figures)
+        ## Action first, its modifier second: the button is what you came for,
+        ## and the format is a detail of how it writes.
+        row.addWidget(render_btn, 2)
+        row.addWidget(self._fig_format, 1)
+        actions_card.add_body(row)
         self._panels["project"].add_card(actions_card)
 
         scripts_card = Card("Scripts", Category.SCRIPTS, icon_name="scripts",
@@ -395,6 +548,10 @@ class HubWindow(QMainWindow):
         edit_btn.clicked.connect(self._action_open_script_editor)
         scripts_card.add_body(edit_btn)
         self._panels["project"].add_card(scripts_card)
+
+    def _set_member_actions_enabled(self, enabled: bool) -> None:
+        for btn in getattr(self, "_member_action_buttons", []):
+            btn.setEnabled(enabled)
 
     def _build_analyze_panel(self) -> None:
         self._analyze_card = Card(
@@ -433,24 +590,11 @@ class HubWindow(QMainWindow):
             subtitle="Buttons here are contributed by the loaded experiment's "
                      "Experiment Type.")
         self._panels["plots"].add_card(self._plot_actions_card)
-
-        card = Card("Publication figures", Category.PLOTS, icon_name="figures",
-                    subtitle="Vector figures from plot_specs.yaml — styles come "
-                             "from the Project, specs from the experiment.")
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Format:"))
-        self._fig_format = QComboBox()
-        self._fig_format.addItems(["svg", "pdf", "png"])
-        row.addWidget(self._fig_format, 1)
-        card.add_body(row)
-
-        render = ActionButton("Render figures", Category.PLOTS, icon_name="figures")
-        render.clicked.connect(self._action_render_figures)
-        card.add_body(render)
-        editor = ActionButton("Plot editor…", Category.PLOTS, icon_name="plot")
-        editor.clicked.connect(self._action_open_plot_editor)
-        card.add_body(editor)
-        self._panels["plots"].add_card(card)
+        ## No Publication-figure card here. Authoring a figure is Plot Editor
+        ## work — the Spec and its Style are what a figure IS (ADR-0005) — and
+        ## rendering is a Project action, because it runs over every member.
+        ## Two buttons on this tile meant a third and fourth place to think
+        ## about figures, each acting on a different subject.
 
     def _build_scripts_panel(self) -> None:
         card = Card("Experiment scripts", Category.SCRIPTS, icon_name="scripts",
@@ -693,6 +837,20 @@ class HubWindow(QMainWindow):
         if item is None:
             return
         name = item.text()
+        config_cell = self._members_table.item(row, 1)
+        if config_cell is not None and config_cell.text() == "missing":
+            ## Not a member yet, so there is nothing to load — but the row is
+            ## exactly one scaffolded config away from being one, and asking
+            ## is cheaper than sending the user to a button they have not
+            ## found yet.
+            resp = QMessageBox.question(
+                self, "Create config",
+                f"'{name}' has no {cfgmod.CONFIG_FILENAME}.\n\nScaffold one "
+                f"from the Project Defaults and make it a member?")
+            if resp == QMessageBox.StandardButton.Yes:
+                self._create_member_config(name)
+                self._refresh_all()
+            return
         try:
             self._experiment = self._project.member(name)
         except ProjectError as exc:
@@ -721,7 +879,51 @@ class HubWindow(QMainWindow):
         self._refresh_scripts()
         self._refresh_exclusion_groups()
         self._refresh_ai()
+        self._refresh_project_card()
         self._refresh_tiles()
+
+    def _refresh_project_card(self) -> None:
+        """The Create/Load card's own state: what the fourth button will do,
+        whether the member actions have anything to inherit from, and the
+        summary line describing what is loaded."""
+        self._set_member_actions_enabled(self._project is not None)
+
+        ## Edit only, never "Create config…": writing a project.yaml into a
+        ## directory that has none IS 'Initialize existing directory…', and
+        ## two buttons doing one thing made the card look like it had four
+        ## ways in when it has three.
+        self._btn_edit_project_cfg.setEnabled(self._project is not None)
+
+        if self._project is None:
+            self._project_summary.setText(
+                "No Project loaded. Open one, create one, or initialize a "
+                "directory you already have — a standalone Experiment "
+                "Directory loads without any of them (ADR-0003).")
+            self._project_summary.setToolTip("")
+            return
+
+        project = self._project
+        members = project.members()
+        pending = project.unconfigured_dirs()
+        parts = [f"<b>{project.name}</b> · {project.type.label} · "
+                 f"{len(members)} member(s)"]
+        if pending:
+            parts.append(f"{len(pending)} directory(ies) with no config: "
+                         f"{', '.join(pending[:4])}"
+                         + (" …" if len(pending) > 4 else ""))
+        if project.question:
+            parts.append(f"Question: {project.question}")
+        divergences = project.divergences()
+        if divergences:
+            ## Declared, never fatal: members address one question in
+            ## different ways, and the Project Report says so on its own page.
+            parts.append("Divergence: "
+                         + "; ".join(d.aspect for d in divergences))
+        problems = project.validate()
+        if problems:
+            parts.append(f"{len(problems)} problem(s) — run Validate YAMLs.")
+        self._project_summary.setText("<br>".join(parts))
+        self._project_summary.setToolTip(str(project.directory))
 
     def _refresh_tiles(self) -> None:
         ## Batch and Project are never dimmed, whatever is selected: they are
@@ -872,7 +1074,8 @@ class HubWindow(QMainWindow):
         ## The Project panel is mixed: its first card carries Open and Create,
         ## which must stay bright with nothing selected, while the two below
         ## it act on a Project that may not exist yet.
-        for card in (self._project_actions_card, self._project_scripts_card):
+        for card in (self._project_members_card, self._project_actions_card,
+                     self._project_scripts_card):
             card.set_dimmed(self._project is None)
 
     def _restyle_cards(self) -> None:
@@ -961,6 +1164,7 @@ class HubWindow(QMainWindow):
                     analysed = "re-run needed" if st.stale else (st.analyzed_at or "yes")
                 self._append_row(self._members_table, [
                     member.name,
+                    "yes",
                     member.type.label,
                     str(st.n_total or "—"),
                     analysed,
@@ -979,6 +1183,24 @@ class HubWindow(QMainWindow):
                         if cell is not None:
                             cell.setForeground(brush)
                             cell.setToolTip(detail)
+            ## The third state, listed rather than left invisible: a folder in
+            ## the Project with no survival_config.yaml is not a member, so
+            ## nothing else in the Hub can see it — and a table that shows
+            ## only the members says a half-set-up Project is a complete one.
+            for item in layout_mod.initializable_dirs(self._project.directory):
+                self._append_row(self._members_table, [
+                    item.name, "missing", "—", "—", "—", "—",
+                ])
+                row = self._members_table.rowCount() - 1
+                brush = QBrush(blocked_color())
+                detail = (item.detail or "No survival_config.yaml — "
+                          "double-click to scaffold one from the Project "
+                          "Defaults.")
+                for column in range(self._members_table.columnCount()):
+                    cell = self._members_table.item(row, column)
+                    if cell is not None:
+                        cell.setForeground(brush)
+                        cell.setToolTip(detail)
             self._project_script.clear()
             from ..script_editor import project_actions
 
@@ -997,8 +1219,10 @@ class HubWindow(QMainWindow):
         """Rebuild the contributed buttons from ``core ∪ type`` (ADR-0002).
 
         One registry, split by the category each Action already declares:
-        plot-producing actions go to the Plots card, beside Render figures;
-        everything else stays on Analyze.
+        plot-producing actions go to the Plots card, everything else to
+        Analyze. Those contributed buttons are now all the Plots panel holds
+        — authoring a Publication Figure is Plot Editor work and rendering
+        one is a Project action.
         """
         analyze = self._analyze_card.body_layout()
         plots = self._plot_actions_card.body_layout()
@@ -1392,18 +1616,264 @@ class HubWindow(QMainWindow):
             return False
         return True
 
-    def _action_add_member(self) -> None:
+    # ── the three states a member directory can be in ──────────────────────
+
+    def _create_member_config(self, name: str):
+        """Scaffold *name*'s ``survival_config.yaml`` from the Project Defaults.
+
+        Returns the member, or None when it failed (reported to the user).
+        Shared by Create experiment, Initialize existing directory, the
+        Experiment configs dialog and the members table's double-click, so
+        every one of them inherits the defaults the same way.
+        """
+        if self._project is None:
+            return None
+        try:
+            member = self._project.add_member(name)
+        except (ProjectError, OSError) as exc:
+            self._warn(f"Could not create the config for '{name}': {exc}")
+            return None
+        self._log.append_line(
+            f"Scaffolded {cfgmod.config_path(member.directory)} from the "
+            f"Project Defaults. Put its data file in {member.data_dir}.")
+        return member
+
+    def _action_create_experiment(self) -> None:
+        """The member does not exist at all: make its directory and scaffold
+        its config from the Project Defaults.
+
+        Everything the config needs is already settled in project.yaml and
+        inherited from it, so the only thing to ask for is the name.
+        """
+        if self._project is None:
+            self._warn("Create or select a Project first — a member's "
+                       "defaults are inherited from its project.yaml.")
+            return
+        name = self._prompt_text("Create experiment",
+                                 "New member directory name:")
+        if not name:
+            return
+        try:
+            directory = self._project.member_dir(name)
+        except ProjectError as exc:
+            self._warn(str(exc))
+            return
+        if is_experiment_dir(directory):
+            self._warn(f"'{name}' already exists and has a config.")
+            return
+        if directory.exists():
+            ## The other state, and it has its own button: initializing looks
+            ## at what is already in the directory instead of assuming it is
+            ## empty.
+            self._warn(
+                f"'{name}' already exists.\n\nUse 'Initialize existing "
+                "directory…' to give the directory you already have a config.")
+            return
+        if self._create_member_config(name) is None:
+            return
+        self._refresh_all()
+        ## The scaffold is a starting point, not a finished member: it has no
+        ## data file yet. Both ways of finishing it are one click away rather
+        ## than left to be found.
+        self._finish_new_member_config(name, directory)
+
+    def _finish_new_member_config(self, name: str, directory: Path) -> None:
+        """Offer the two ways to finish a just-created member.
+
+        What a fresh member lacks here is its **workbook** — the config is
+        conformant the moment it is written, because everything but the data
+        is inherited. Copying a config from a member that already works is the
+        second offer, for the run whose members share an input format and an
+        exclusion group.
+        """
+        box = QMessageBox(self)
+        box.setWindowTitle("Create experiment")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(f"'{name}' is ready, with a {cfgmod.CONFIG_FILENAME} "
+                    f"scaffolded from the Project Defaults.")
+        box.setInformativeText(
+            "It has no data yet. Add its workbook now, or copy a config from "
+            "a member that is already set up.")
+        data_btn = box.addButton("Add data file…",
+                                 QMessageBox.ButtonRole.AcceptRole)
+        copy_btn = box.addButton("Copy config from…",
+                                 QMessageBox.ButtonRole.ActionRole)
+        box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(data_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is data_btn:
+            self._add_member_data_file(name, directory)
+        elif clicked is copy_btn:
+            self._copy_member_config(name, directory)
+        self._refresh_all()
+
+    def _add_member_data_file(self, name: str, directory: Path) -> None:
+        """Copy a chosen data file into a new member's ``data/``."""
+        import shutil
+
+        chosen, _filter = QFileDialog.getOpenFileName(
+            self, f"Choose the data file for '{name}'",
+            str(self._project.directory if self._project else directory),
+            "Survival data (*.xlsx *.csv *.tsv);;All files (*)")
+        if not chosen:
+            return
+        source = Path(chosen).resolve()
+        target = directory / "data" / source.name
+        if target.exists() and target.resolve() == source:
+            return
+        if target.exists():
+            self._warn(f"{target} already exists — nothing was copied.")
+            return
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+        except OSError as exc:
+            self._warn(f"Could not copy '{source.name}':\n{exc}")
+            return
+        self._log.append_line(f"Copied {source} to {target}")
+
+    def _copy_member_config(self, name: str, directory: Path) -> bool:
+        """Replace *name*'s scaffolded config with one chosen from elsewhere.
+
+        Checked **before** it is written, with the one rule every member is
+        held to at load time (ADR-0001): a config of the wrong Experiment Type
+        makes the whole Project refuse to load, and the user would otherwise
+        have to find and undo the copy by hand. Differing factors and levels
+        are Divergence, not error, so they are not grounds to refuse.
+        """
+        import shutil
+
+        project = self._project
+        if project is None:
+            return False
+        chosen, _filter = QFileDialog.getOpenFileName(
+            self, f"Choose a {cfgmod.CONFIG_FILENAME} to copy into '{name}'",
+            str(project.directory),
+            f"Member config ({cfgmod.CONFIG_FILENAME});;"
+            "YAML files (*.yaml *.yml);;All files (*)")
+        if not chosen:
+            return False
+        source = Path(chosen).resolve()
+        target = cfgmod.config_path(directory)
+        if target.exists() and source == target.resolve():
+            self._warn(f"That is '{name}'s own config — nothing was copied.")
+            return False
+        try:
+            config = cfgmod.read_yaml(source)
+        except (OSError, ValueError) as exc:
+            self._warn(f"'{source.name}' could not be read:\n{exc}\n\n"
+                       "The scaffolded config is still in place.")
+            return False
+        problems = project.type_problems_for(config, source.name)
+        if problems:
+            self._warn(
+                f"'{source.name}' cannot be a member of {project.name}:\n  - "
+                + "\n  - ".join(problems[:6])
+                + ("\n  - …" if len(problems) > 6 else "")
+                + "\n\nNothing was copied; the scaffolded config is still in "
+                "place.")
+            return False
+        try:
+            shutil.copyfile(source, target)
+        except OSError as exc:
+            self._warn(f"Could not copy '{source.name}':\n{exc}")
+            return False
+        self._log.append_line(f"Copied {source} to {target}")
+        ## Conforming is not the same as usable. Report what is left rather
+        ## than let the member fail at run time — the same split upstream
+        ## makes between "would break the Project" (refused above) and "would
+        ## break this member" (said here).
+        remaining = cfgmod.validate_config(
+            cfgmod.merge_defaults(config, project.defaults))
+        if remaining:
+            self._log.append_line(
+                f"[config] {name}: {len(remaining)} thing(s) still to fix — "
+                + "; ".join(remaining[:3]))
+        ## A copied config restates what the scaffold inherited, which freezes
+        ## today's Project Defaults into this member. `experiment_type` is
+        ## exempt: every member states its own, minimal scaffolds included.
+        restated = sorted(set(config) & set(project.defaults)
+                          - {"experiment_type"})
+        if restated:
+            self._log.append_line(
+                f"[config] {name}: {', '.join(restated)} now stated in the "
+                f"member, so edits to the Project Defaults no longer reach "
+                f"it.")
+        return True
+
+    def _action_initialize_experiment(self) -> None:
+        """The member's directory exists but its config does not: scaffold one.
+
+        Nothing is moved on the way — unlike the sister app, this loader reads
+        ``data/`` *and* the directory root, so a workbook loose in the folder
+        is already where it will be found (ADR-0009). What remains is the
+        config, and the one question the loader refuses to answer for itself:
+        which file is the experiment, when there is more than one.
+        """
+        project = self._project
+        if project is None:
+            self._warn("Create or select a Project first — a member's "
+                       "defaults are inherited from its project.yaml.")
+            return
+        candidates = layout_mod.initializable_dirs(project.directory)
+        if not candidates:
+            self._warn(
+                f"Every directory in '{project.name}' already has a "
+                f"{cfgmod.CONFIG_FILENAME}.\n\nUse 'Create experiment…' to "
+                f"make a new member.")
+            return
+        labels = [f"{item.name}  —  {item.status or 'empty'}"
+                  for item in candidates]
+        choice = self._prompt_choice(
+            "Initialize existing directory",
+            f"Directory to make a member of '{project.name}':", labels)
+        if choice is None:
+            return
+        item = candidates[labels.index(choice)]
+
+        ## Re-classify rather than trusting the listing: it was built before
+        ## the user had a chance to change anything on disk.
+        state = layout_mod.classify(item.directory)
+        if state.status == layout_mod.UNREADABLE:
+            self._warn(f"'{state.name}': {state.detail or state.status}\n\n"
+                       "This one has to be sorted out by hand.")
+            return
+        member = self._create_member_config(item.name)
+        if member is None:
+            return
+        ## Several candidate files and no `data_file:` is the one blocked
+        ## state a scaffold does not clear, and the answer is the user's.
+        after = layout_mod.classify(item.directory)
+        if after.fix == "data_file" and after.candidates:
+            self._name_member_data_file(after)
+        self._refresh_all()
+
+    def _name_member_data_file(self, item) -> None:
+        """Write ``data_file:`` into an ambiguous member's config."""
+        choice = self._prompt_choice(
+            f"Which file is {item.name}?", "The experiment's data file:",
+            list(item.candidates))
+        if choice is None:
+            return
+        config = cfgmod.load_config(item.directory)
+        config["data_file"] = choice
+        cfgmod.save_config(item.directory, config)
+        self._log.append_line(f"{item.name}: data_file: {choice}")
+
+    def _action_member_configs(self) -> None:
+        """The bulk view over every subdirectory's config."""
         if self._project is None:
             self._warn("Create or select a Project first.")
             return
-        name = self._prompt_text("Add member", "Directory name for the new "
-                                               "Member Experiment:")
-        if not name:
-            return
-        member = self._project.add_member(name)
-        self._log.append_line(f"Scaffolded {member.directory} from the Project defaults. "
-                         f"Put its data file in {member.data_dir}.")
+        from .project_dialogs import MemberConfigsDialog
+
+        dialog = MemberConfigsDialog(self, self._project,
+                                     log=self._log.append_line)
+        dialog.exec()
         self._refresh_all()
+
+    # ── ADR-0008: the two ways a member arrives from outside ───────────────
 
     def _action_add_directory(self) -> None:
         if self._project is None:
@@ -1445,29 +1915,62 @@ class HubWindow(QMainWindow):
             f"{member.data_dir}.")
         self._refresh_all()
 
+    # ── the three states a Project directory can be in ─────────────────────
+
     def _action_create_project(self) -> None:
-        if self._selection is None:
-            self._warn("Open a directory first.")
+        """The Project does not exist yet: choose where it goes and name it."""
+        from .project_dialogs import ProjectInfoDialog
+
+        start = str(self._selection) if self._selection else ""
+        dialog = ProjectInfoDialog(self, start_dir=start)
+        if dialog.exec() and dialog.saved_dir:
+            self._log.append_line(
+                f"Wrote {Path(dialog.saved_dir) / cfgmod.PROJECT_FILENAME}")
+            self._set_selection(dialog.saved_dir)
+            self._refresh_all()
+
+    def _action_initialize_project(self) -> None:
+        """Promote a directory that already exists — usually with experiment
+        subdirectories in it — into a Project, keeping its own name.
+
+        The third way in: Open project wants a project.yaml already there,
+        Create project makes the directory too.
+        """
+        from .project_dialogs import ProjectInfoDialog
+
+        ## Prefilling a directory that is already a Project would only earn the
+        ## dialog's refusal, so offer the selection only when it is the kind of
+        ## directory this button takes.
+        start = ""
+        if self._selection is not None and not is_project_dir(self._selection):
+            start = str(self._selection)
+        dialog = ProjectInfoDialog(self, start_dir=start,
+                                   initialize_existing=True)
+        if dialog.exec() and dialog.saved_dir:
+            self._log.append_line(
+                f"Initialized {Path(dialog.saved_dir) / cfgmod.PROJECT_FILENAME}")
+            self._set_selection(dialog.saved_dir)
+            self._refresh_all()
+
+    def _action_edit_project_config(self) -> None:
+        """Edit the open Project's ``project.yaml``.
+
+        Only ever an edit. Writing the file into a directory that has none is
+        the third button's job — 'Initialize existing directory…' does exactly
+        that, and having this one do it too meant two controls with one
+        behaviour.
+        """
+        from .project_dialogs import ProjectInfoDialog
+
+        if self._project is None:
+            self._warn("Open a Project first. To give a directory its first "
+                       "project.yaml, use 'Initialize existing directory…'.")
             return
-        target = self._selection
-        if is_experiment_dir(target):
-            # Writing project.yaml here would make a Project with zero members.
-            target = target.parent
-        if is_project_dir(target):
-            self._warn(f"{target} is already a Project.")
-            return
-        types = available_types()
-        labels = [t.label for t in types]
-        choice = self._prompt_choice("Create project", "Experiment type:", labels)
-        if choice is None:
-            return
-        exp_type = types[labels.index(choice)]
-        question = self._prompt_text("Create project",
-                                     "What question do these experiments address?")
-        project = Project.create(target, question=question or "",
-                                 type_key=None if exp_type.is_custom else exp_type.key)
-        self._log.append_line(f"Created {project.config_path}")
-        self._set_selection(target)
+        dialog = ProjectInfoDialog(self, start_dir=str(self._project.directory))
+        if dialog.exec() and dialog.saved_dir:
+            self._log.append_line(
+                f"Saved {Path(dialog.saved_dir) / cfgmod.PROJECT_FILENAME}")
+            self._set_selection(dialog.saved_dir)
         self._refresh_all()
 
     def _action_set_exclusion_group(self) -> None:
@@ -1502,29 +2005,88 @@ class HubWindow(QMainWindow):
         self._qc_window = viewer
 
     def _action_render_figures(self) -> None:
-        if self._experiment is None:
-            self._warn("Load an experiment first.")
-            return
-        from .. import pubfigures
+        """Render every member's curated Publication Figures.
 
-        experiment, fmt = self._experiment, self._fig_format.currentText()
+        Runs the registered ``render_publication_figures`` action rather than
+        calling ``pubfigures.render_all`` directly, so this button and a
+        Batch Run cannot drift apart about which members get figures — the
+        skip-the-uncurated rule (ADR-0005) is stated once, in the action.
+        """
+        if self._project is None:
+            self._warn("Select a Project first — rendering walks its members.")
+            return
+        from ..script_editor import project_actions
+
+        project, fmt = self._project, self._fig_format.currentText()
 
         def _job():
-            written = pubfigures.render_all(experiment, fmt=fmt, log=print)
-            return f"{len(written)} figure(s) in {experiment.figures_dir}"
+            project_actions.run_script(
+                project,
+                [{"action": "render_publication_figures", "format": fmt}],
+                log=print)
+            return f"Publication figures rendered as {fmt}."
 
         self._spawn("Render publication figures", _job)
 
+    def _selected_member(self):
+        """The member the members table is pointing at, if it is one.
+
+        A row for an unconfigured directory is not a member and answers None,
+        the same as no selection at all.
+        """
+        if self._project is None:
+            return None
+        rows = {i.row() for i in self._members_table.selectedIndexes()}
+        if len(rows) != 1:
+            return None
+        row = rows.pop()
+        name_cell = self._members_table.item(row, 0)
+        config_cell = self._members_table.item(row, 1)
+        if name_cell is None or config_cell is None or config_cell.text() != "yes":
+            return None
+        try:
+            return self._project.member(name_cell.text())
+        except ProjectError:
+            return None
+
+    def _plot_editor_subject(self):
+        """Which member the Plot Editor opens on, from the Project panel.
+
+        Specs are per-experiment (ADR-0005), so the editor always has one
+        member as its subject — but this is now the only way in, so it
+        resolves one rather than refusing without a loaded experiment: the
+        selected row, else the loaded member, else the only member there is,
+        else ask.
+        """
+        member = self._selected_member()
+        if member is not None:
+            return member
+        if self._experiment is not None:
+            return self._experiment
+        if self._project is None:
+            return None
+        members = self._project.members()
+        if len(members) == 1:
+            return members[0]
+        if not members:
+            self._warn("This Project has no Member Experiments yet — a Plot "
+                       "Spec belongs to one, so there is nothing to author.")
+            return None
+        names = [m.name for m in members]
+        choice = self._prompt_choice(
+            "Plot editor", "Author which member's figures?", names)
+        return members[names.index(choice)] if choice in names else None
+
     def _action_open_plot_editor(self) -> None:
-        if self._experiment is None:
-            self._warn("Load an experiment first — the Plot Editor is "
-                       "experiment-level here, because figures are per member.")
+        subject = self._plot_editor_subject()
+        if subject is None:
             return
         from .plot_editor import PlotEditorWindow
 
-        editor = PlotEditorWindow(self._experiment)
+        editor = PlotEditorWindow(subject)
         editor.show()
         self._plot_editor = editor
+        self._log.append_line(f"Plot Editor: {subject.name}")
 
     def _action_run_experiment_script(self) -> None:
         if self._experiment is None:

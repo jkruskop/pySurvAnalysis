@@ -255,3 +255,70 @@ def test_add_experiment_will_not_clobber_an_existing_member(project):
 def test_missing_project_marker_is_a_helpful_error(tmp_path):
     with pytest.raises(ProjectError, match="not a Project"):
         Project(tmp_path)
+
+
+# ── the three states a member directory can be in ──────────────────────────
+
+def test_initializable_dirs_finds_what_members_in_cannot(project):
+    """The two walks answer different questions, and the picker needs both.
+
+    ``members_in`` drops a folder that is not experiment-shaped *yet*, which
+    is exactly the folder 'Initialize existing directory…' exists for.
+    """
+    from pysurvanalysis.domain import layout as layout_mod
+
+    (project.directory / "empty_so_far").mkdir()
+    names = [i.name for i in layout_mod.initializable_dirs(project.directory)]
+    assert names == ["empty_so_far"]                 # the members are excluded
+    assert "empty_so_far" not in [
+        i.name for i in layout_mod.members_in(project.directory)]
+    assert project.unconfigured_dirs() == ["empty_so_far"]
+
+
+def test_a_reported_project_does_not_offer_its_own_figures_as_a_member(project):
+    """``<stem>_figures`` is a report's own output, not a candidate member.
+
+    It is matched by suffix because the stem is the report's, so a Project
+    that has been reported on once would otherwise list its figure dump every
+    time the picker opened.
+    """
+    from pysurvanalysis.domain import layout as layout_mod
+
+    (project.directory / f"{project.directory.name}_report_figures").mkdir()
+    assert layout_mod.initializable_dirs(project.directory) == []
+
+
+def test_member_dir_refuses_a_name_that_escapes_the_project(project):
+    for bad in ("../elsewhere", "nested/deep", "..", ""):
+        with pytest.raises(ProjectError, match="single folder name"):
+            project.member_dir(bad)
+    assert project.member_dir("rep_c") == project.directory / "rep_c"
+
+
+def test_type_problems_for_enforces_the_type_and_nothing_else(project):
+    """The one rule a copied config is checked against before it is written.
+
+    Differing factors and levels are Divergence — legal, and declared on the
+    report — so a config that merely disagrees about them is still a member.
+    """
+    from pysurvanalysis.experiment_types import get_type
+
+    same = get_type("interaction").scaffold_config()
+    assert project.type_problems_for(same, "rep_a.yaml") == []
+
+    ## Different levels, same type: divergence, not an error.
+    diverging = dict(same, factors={"Genotype": ["mut", "wt"],
+                                    "Treatment": ["drug", "ctrl"]})
+    assert project.type_problems_for(diverging, "other.yaml") == []
+
+    ## An ordinary config problem is reported after the write, not grounds to
+    ## refuse one: it breaks the member, not the Project.
+    broken = dict(same, input={"format": "nonsense"})
+    assert project.type_problems_for(broken, "broken.yaml") == []
+
+    wrong = get_type("standard_lifespan").scaffold_config()
+    problems = project.type_problems_for(wrong, "wrong.yaml")
+    assert problems == ["wrong.yaml is a Standard Lifespan but the Project's "
+                        "type is Interaction Experiment. Every Member "
+                        "Experiment must share it — the type selects the "
+                        "analyses, the Plot Set and the report sections."]

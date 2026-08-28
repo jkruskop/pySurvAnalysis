@@ -113,3 +113,41 @@ def test_project_report_writes_both_formats(analysed):
     written = project_report.write_project_report(analysed)
     assert written["pdf"].is_file() and written["md"].is_file()
     assert written["pdf"].parent == analysed.directory
+
+
+def test_a_section_divider_is_not_asked_to_break_twice(analysed):
+    """A ``SectionDivider`` starts its own page, so a ``PageBreak`` in front of
+    one produces a page holding nothing but the running header and footer.
+
+    Asserted on the model, where the mistake is made: every member used to get
+    an explicit break before its divider, and the reader got a blank page per
+    member.
+    """
+    report = project_report.build_project_report(analysed)
+    kinds = [type(b) for b in report.blocks]
+    for i, kind in enumerate(kinds[:-1]):
+        if kind is m.PageBreak:
+            assert kinds[i + 1] is not m.SectionDivider, (
+                f"block {i} breaks the page immediately before a "
+                f"SectionDivider, which breaks it again")
+
+
+def test_the_pdf_backend_collapses_consecutive_page_breaks(tmp_path):
+    """The rule lives in the backend too: a caller cannot see from the model
+    that a divider starts its own page, so writing the break by hand has to be
+    harmless rather than merely discouraged."""
+    from reportlab.platypus import PageBreak
+
+    from pysurvanalysis.report_pkg.backends import reportlab_backend as rl
+
+    report = m.Report(title="doubled")
+    report.add(m.Paragraph("before"))
+    report.add(m.PageBreak())
+    report.add(m.PageBreak())
+    report.add(m.SectionDivider("A section"))
+    report.add(m.Paragraph("after"))
+
+    flow = rl._blocks_to_flowables(report, rl._styles())
+    breaks = [i for i, f in enumerate(flow) if isinstance(f, PageBreak)]
+    assert all(b + 1 not in breaks for b in breaks), \
+        "two PageBreaks in a row would render an empty page"

@@ -1,0 +1,7 @@
+group1,group2,chi2,p_value,df,p_bonferroni,significant_0.05
+Female/20x,Female/40x,14.3305,0.0001533558847293115,1,0.000920135308375869,True
+Female/20x,Male/20x,523.6485,0.0,1,0.0,True
+Female/20x,Male/40x,764.3809,0.0,1,0.0,True
+Female/40x,Male/20x,585.3872,0.0,1,0.0,True
+Female/40x,Male/40x,1082.7859,0.0,1,0.0,True
+Male/20x,Male/40x,36.5521,1.486377465553801e-09,1,8.918264793322805e-09,True
