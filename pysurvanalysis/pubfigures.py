@@ -875,12 +875,16 @@ def _build_forest(data: pd.DataFrame, spec: PlotSpec, style: PlotStyle,
     layer, _fill = _point_layer_xy(data, style, "label", x="ratio", y="label")
     g = (g + layer
          + p9.scale_color_manual(values=colours, guide=None)
-         + p9.scale_x_log10()
-         + p9.labs(title=spec.title or None,
-                   x=spec.x_label or "Hazard ratio (log scale)",
-                   y=spec.y_label or kind.y_label)
-         + _theme_for(style))
-    return g
+         + p9.scale_x_log10())
+    ## Only x is pinnable: the ratio axis is numeric, the other is the list
+    ## of comparisons. A limit must stay positive — log10(0) has no where.
+    if spec.x_limits and all(v > 0 for v in spec.x_limits):
+        g = g + p9.coord_cartesian(xlim=tuple(spec.x_limits))
+    return (g
+            + p9.labs(title=spec.title or None,
+                      x=spec.x_label or "Hazard ratio (log scale)",
+                      y=spec.y_label or kind.y_label)
+            + _theme_for(style))
 
 
 def _build_distribution(data: pd.DataFrame, spec: PlotSpec, style: PlotStyle,
@@ -896,6 +900,16 @@ def _build_distribution(data: pd.DataFrame, spec: PlotSpec, style: PlotStyle,
          + p9.geom_density(alpha=style.ci_alpha, size=style.line_width))
     if spec.facet_by and "_facet" in data.columns:
         g = g + p9.facet_wrap("_facet", nrow=1)
+    coord_args = {}
+    if spec.x_limits:
+        coord_args["xlim"] = tuple(spec.x_limits)
+    if spec.y_limits:
+        coord_args["ylim"] = tuple(spec.y_limits)
+    if coord_args:
+        ## coord_cartesian, never scale limits: a scale limit DROPS the data
+        ## outside it before the density is estimated, so zooming would
+        ## silently re-shape the curves.
+        g = g + p9.coord_cartesian(**coord_args)
     return (g
             + p9.scale_color_manual(values=colours,
                                     name=spec.series_label or "Treatment")
@@ -922,7 +936,11 @@ def _build_interaction(data: pd.DataFrame, spec: PlotSpec, style: PlotStyle,
          + p9.geom_errorbar(p9.aes(ymin="ci_lo", ymax="ci_hi"), width=0.06,
                             size=style.line_width * 0.8, show_legend=False))
     layer, _fill = _point_layer_xy(data, style, "label", x="x", y="value")
-    return (g + layer
+    g = g + layer
+    ## Only y is pinnable: the other axis is the factor's levels.
+    if spec.y_limits:
+        g = g + p9.coord_cartesian(ylim=tuple(spec.y_limits))
+    return (g
             + p9.scale_color_manual(values=colours,
                                     name=spec.series_label or "Treatment")
             + p9.labs(title=spec.title or None, x=spec.x_label,

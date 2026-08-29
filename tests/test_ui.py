@@ -263,10 +263,9 @@ def test_plot_editor_opens_on_the_headline_figure(qapp, analysed_project):
         editor.close()
 
 
-def test_plot_editor_saves_both_halves_to_the_project(qapp, analysed_project):
-    """Specs AND Styles land in the container's one plot_specs.yaml — the
-    sister app's model: what is saved here is the project default every
-    member renders with."""
+def test_plot_editor_saves_the_figure_with_its_own_style(qapp, analysed_project):
+    """One save = one figure's spec plus a style OWNED by that figure, both in
+    the container's plot_specs.yaml. Every member renders with them."""
     from pysurvanalysis import pubfigures as pf
     from pysurvanalysis.apps.plot_editor import PlotEditorWindow
     from pysurvanalysis.domain import config as cfgmod
@@ -278,20 +277,78 @@ def test_plot_editor_saves_both_halves_to_the_project(qapp, analysed_project):
         editor._title_edit.setText("A curated title")
         editor._width.setValue(160.0)
         editor._save_spec()
-        editor._save_style()
     finally:
         editor.close()
 
     payload = cfgmod.read_yaml(project.specs_path)
     assert payload["plots"]["km_faceted"]["title"] == "A curated title"
-    assert payload["styles"]["default"]["width_mm"] == 160.0
+    assert payload["plots"]["km_faceted"]["style"] == "km_faceted"
+    assert payload["styles"]["km_faceted"]["width_mm"] == 160.0
     ## And nothing was written into the member.
     assert not (member.directory / cfgmod.SPECS_FILENAME).exists() \
         or "plots" not in cfgmod.read_yaml(
             member.directory / cfgmod.SPECS_FILENAME)
-    ## The other member sees the same curation.
+    ## The other member sees the same curation, style included.
     assert pf.specs_for(project.member("rep_b"))["km_faceted"].title \
         == "A curated title"
+    assert pf.resolve_style("km_faceted",
+                            project.member("rep_b")).width_mm == 160.0
+
+
+def test_each_figure_owns_its_style(editor):
+    """Editing one figure's look must not restyle another — the shared
+    'default' object used to leak every edit across the whole Plot Set."""
+    editor._plot_combo.setCurrentText("km_curves")
+    km_width = editor._line_width.value()
+
+    editor._plot_combo.setCurrentText("log_log")
+    editor._line_width.setValue(km_width + 1.0)
+    editor._harvest()
+
+    editor._plot_combo.setCurrentText("km_curves")
+    assert editor._line_width.value() == km_width
+
+    ## Sharing a look is deliberate: Copy style from… another figure.
+    import PyQt6.QtWidgets as qtw
+
+    editor._plot_combo.setCurrentText("km_faceted")
+    orig = qtw.QInputDialog.getItem
+    qtw.QInputDialog.getItem = staticmethod(
+        lambda *_a, **_k: ("log_log (figure)", True))
+    try:
+        editor._copy_style_from()
+    finally:
+        qtw.QInputDialog.getItem = orig
+    assert editor._line_width.value() == km_width + 1.0
+
+
+def test_axis_limits_are_optional_and_round_trip(editor):
+    """Each axis is pinned by its checkbox; unchecked autoscales. A lo/hi
+    typed the wrong way round pins the range rather than inverting the
+    axis."""
+    assert not editor._xlim_check.isChecked()
+    assert not editor._ylim_check.isChecked()
+    spec, _style = editor._harvest()
+    assert spec.x_limits == [] and spec.y_limits == []
+
+    editor._xlim_check.setChecked(True)
+    editor._xlim_lo.setValue(80.0)                # deliberately reversed
+    editor._xlim_hi.setValue(10.0)
+    editor._ylim_check.setChecked(True)
+    editor._ylim_lo.setValue(0.0)
+    editor._ylim_hi.setValue(0.8)
+    spec, _style = editor._harvest()
+    assert spec.x_limits == [10.0, 80.0]
+    assert spec.y_limits == [0.0, 0.8]
+
+    editor._load_spec_into_form()
+    assert editor._xlim_check.isChecked()
+    assert (editor._xlim_lo.value(), editor._xlim_hi.value()) == (10.0, 80.0)
+
+    editor._xlim_check.setChecked(False)
+    spec, _style = editor._harvest()
+    assert spec.x_limits == []
+    assert spec.y_limits == [0.0, 0.8]            # the other axis stays pinned
 
 
 def test_script_editor_switches_level_and_registry(qapp, analysed_project):
@@ -1078,9 +1135,11 @@ def test_save_writes_only_the_current_figure(editor):
     current = editor._current_id
     assert list(payload["plots"]) == [current]
     assert payload["plots"][current]["title"] == "Only me"
-    ## And the style it references was saved with it: a spec against an
-    ## unsaved style would render with the stale copy on disk.
-    assert payload["plots"][current]["style"] in payload["styles"]
+    ## And the style it references was saved with it, under the figure's own
+    ## name: a spec against an unsaved style would render with the stale copy
+    ## on disk.
+    assert payload["plots"][current]["style"] == current
+    assert current in payload["styles"]
 
 
 def test_a_failed_preview_still_says_so_in_the_preview(editor, monkeypatch):
@@ -1115,3 +1174,49 @@ def test_the_reference_line_is_governed_by_its_checkbox(editor):
     editor._load_spec_into_form()                 # and it round-trips
     assert editor._ref_check.isChecked()
     assert editor._reference_line.value() == -0.25
+
+
+def test_export_writes_to_project_figures_without_asking(editor, monkeypatch):
+    """One click, one file: the figure lands in <container>/figures/ named for
+    the plot, and a taken name gets _1, _2… rather than overwriting — so two
+    iterations of a figure can sit side by side."""
+    import PyQt6.QtWidgets as qtw
+
+    monkeypatch.setattr(
+        qtw.QFileDialog, "getSaveFileName",
+        staticmethod(lambda *a, **k: pytest.fail("export must not open a "
+                                                 "file dialog")))
+    editor._export()
+    editor._export()
+    figures = editor._specs_root / "figures"
+    current = editor._current_id
+    assert sorted(p.name for p in figures.iterdir()) == [
+        f"{current}.svg", f"{current}_1.svg"]
+    assert str(figures) in editor._status.currentMessage()
+
+
+def test_add_directory_refuses_a_folder_already_inside_the_project(fresh_hub,
+                                                                   monkeypatch):
+    """Add directory is strictly the way in from OUTSIDE (ADR-0010): for a
+    folder already in the Project it overlapped Initialize with stricter
+    rules, so an empty inside folder failed confusingly here and worked
+    there. Now it refuses and names the right button."""
+    import PyQt6.QtWidgets as qtw
+
+    inside = fresh_hub._project.directory / "rep_b_bare"
+    monkeypatch.setattr(qtw.QFileDialog, "getExistingDirectory",
+                        staticmethod(lambda *a, **k: str(inside)))
+    fresh_hub._action_add_directory()
+    assert "Initialize existing directory" in fresh_hub._warned[-1]
+    assert not (inside / "survival_config.yaml").exists()
+
+
+def test_pyplot_runs_on_agg_so_worker_figures_are_thread_safe(hub):
+    """Analyses run on worker threads and build their figures with pyplot.
+    Under the auto-selected QtAgg backend every one constructed a Qt canvas
+    off the main thread — a warning per figure, and a genuine hazard. Nothing
+    needs pyplot's GUI machinery: tabs re-bind explicitly with
+    FigureCanvasQTAgg."""
+    import matplotlib
+
+    assert matplotlib.get_backend().lower() == "agg"

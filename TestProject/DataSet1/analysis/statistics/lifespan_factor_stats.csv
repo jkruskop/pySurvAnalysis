@@ -1,5 +1,0 @@
-group,n,n_deaths,n_censored,mean_rmst,median,t_max
-Sex=Female,2800,122,2678,941.87,,958.05
-Sex=Male,2800,655,2145,875.86,,958.05
-Density=20x,1800,90,1710,945.53,,958.05
-Density=40x,3800,687,3113,891.94,,958.05

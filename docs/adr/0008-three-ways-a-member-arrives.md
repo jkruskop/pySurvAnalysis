@@ -47,3 +47,12 @@ refuses a name whose folder already exists instead of adopting whatever is in
 it. **Add directory** and **Add experiment** are unchanged, and keep their
 place on the card under a divider: they are the two ways in from *outside* the
 Project, and everything above the divider stays inside it.
+
+That boundary is now enforced, not just drawn: the Hub's **Add directory**
+refuses a folder that is already a direct child of the Project, naming
+*Initialize existing directory…* instead. The two used to overlap there —
+`adopt_directory` adopts an inside folder in place, but with this button's
+stricter demands (a `data/` folder holding a validating workbook), so an
+empty inside folder failed confusingly here and worked there. The domain
+method keeps its in-place branch for callers that already know what they
+have; the *button* is outside-only.

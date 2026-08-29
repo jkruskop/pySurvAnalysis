@@ -13,11 +13,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from ..gui_env import sanitize_input_method_environment
+from ..gui_env import sanitize_input_method_environment, use_agg_matplotlib
 
 ## Before Qt is imported, not after: the overrides are read when the
 ## platform plugin initialises.
 sanitize_input_method_environment()
+use_agg_matplotlib()
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPixmap
@@ -27,7 +28,6 @@ from PyQt6.QtWidgets import (
     QColorDialog,
     QComboBox,
     QDoubleSpinBox,
-    QFileDialog,
     QFontComboBox,
     QFormLayout,
     QHBoxLayout,
@@ -156,6 +156,17 @@ def _combo(items) -> _NoWheelCombo:
     return box
 
 
+def _free_path(directory: Path, stem: str, suffix: str) -> Path:
+    """``<stem>.<suffix>`` in *directory*, or ``<stem>_1``, ``_2``… — the
+    first name not already taken."""
+    candidate = directory / f"{stem}.{suffix}"
+    counter = 1
+    while candidate.exists():
+        candidate = directory / f"{stem}_{counter}.{suffix}"
+        counter += 1
+    return candidate
+
+
 def _fmt_number(value) -> str:
     """Render a float without a trailing ``.0`` — the times a user typed come
     back looking like the times a user typed."""
@@ -207,8 +218,22 @@ class PlotEditorWindow(QMainWindow):
         self._project_specs = pf.adopt_legacy_member_specs(experiment)
         self._specs = pf.fill_default_specs(self._project_specs.plots,
                                             experiment)
-        self._styles = self._project_specs.styles
-        self._default_style = self._project_specs.default_style
+        ## EVERY figure gets its own working style, deep-copied from whatever
+        ## its spec references (else the container's default). One shared
+        ## style object meant editing the mortality plot's line width silently
+        ## restyled the KM curves too — "the styles is common to all plots" —
+        ## and saving could never record a per-figure look.
+        import copy as _copy
+
+        library = self._project_specs.styles
+        default = library.get(self._project_specs.default_style,
+                              pf.BUILTIN_STYLE)
+        self._plot_styles: dict[str, pf.PlotStyle] = {}
+        for plot_id, spec in self._specs.items():
+            seed = library.get(spec.style, default)
+            style = _copy.deepcopy(seed)
+            style.name = plot_id
+            self._plot_styles[plot_id] = style
         self._lifetables = None
         self._current_id = (experiment.type.headline_plot_id
                             if experiment.type.headline_plot_id in self._specs
@@ -234,21 +259,22 @@ class PlotEditorWindow(QMainWindow):
         outer.setSpacing(8)
 
         bar = TopBar(f"Plot Editor — {self.experiment.name}")
-        save_spec = QPushButton(icon("save"), " Save this figure to project")
+        save_spec = QPushButton(icon("save"), " Save Project default")
         save_spec.setToolTip(
-            "Write THIS figure's spec, and the style it uses, into the "
-            "container's plot_specs.yaml. Only saved figures are rendered by "
-            "'Render publication figures' — the rest of the Plot Set stays "
-            "editable here without being curated.")
+            "Write THIS figure's spec and its own style into the container's "
+            "plot_specs.yaml. Every figure owns its style — use 'Copy style "
+            "from…' to share a look. Only saved figures are rendered by "
+            "'Render publication figures'.")
         save_spec.clicked.connect(self._save_spec)
-        save_style = QPushButton(icon("save_as"), " Save styles to project")
-        save_style.setToolTip(
-            "Write the whole Style library and the default-style name — "
-            "without touching which figures are curated.")
-        save_style.clicked.connect(self._save_style)
-        export = QPushButton(icon("figures"), " Export…")
+        export = QPushButton(icon("figures"), " Export SVG")
+        export.setToolTip(
+            "Write this figure to the project's figures/ folder as SVG with "
+            "editable text — no dialog. The file is named for the plot; a "
+            "name already taken gets _1, _2… rather than overwriting. Use "
+            "'Render publication figures' on the Project panel for every "
+            "curated figure at once, or in pdf/png.")
         export.clicked.connect(self._export)
-        for btn in (save_spec, save_style, export):
+        for btn in (save_spec, export):
             bar.add_right(btn)
         outer.addWidget(bar)
 
@@ -309,6 +335,32 @@ class PlotEditorWindow(QMainWindow):
             widget.editingFinished.connect(self._refresh_preview)
             form.addRow(label, widget)
 
+        ## Same pattern as the sister app and the reference line below:
+        ## a checkbox says whether the axis is pinned at all, the pair says
+        ## where. Unchecked, the axis autoscales to the data — the right
+        ## default, and the reason these are on the Spec: pinned limits are a
+        ## per-figure editorial decision (two figures meant to sit side by
+        ## side), not a look.
+        self._xlim_check = QCheckBox()
+        self._xlim_lo = _spin(-1e6, 1e6, 1.0, 2)
+        self._xlim_hi = _spin(-1e6, 1e6, 1.0, 2)
+        self._ylim_check = QCheckBox()
+        self._ylim_lo = _spin(-1e6, 1e6, 0.05, 3)
+        self._ylim_hi = _spin(-1e6, 1e6, 0.05, 3)
+        self._ylim_hi.setValue(1.0)
+        for check, lo, hi, label in (
+                (self._xlim_check, self._xlim_lo, self._xlim_hi, "X limits:"),
+                (self._ylim_check, self._ylim_lo, self._ylim_hi, "Y limits:")):
+            check.setToolTip("Pin this axis. Unchecked, it autoscales to "
+                            "the data.")
+            for spin in (lo, hi):
+                spin.setEnabled(False)
+                spin.valueChanged.connect(self._refresh_preview)
+            check.toggled.connect(lo.setEnabled)
+            check.toggled.connect(hi.setEnabled)
+            check.toggled.connect(self._refresh_preview)
+            form.addRow(label, _row(check, lo, QLabel("–"), hi))
+
         ## A checkbox, not a magic value: "none" used to be spelled -1.0,
         ## which both hid a legal value (a log-log reference is negative) and
         ## made "no line" a thing you scroll to rather than a thing you say.
@@ -323,10 +375,13 @@ class PlotEditorWindow(QMainWindow):
         form.addRow("Reference line:", _row(self._ref_check,
                                             self._reference_line))
 
-        self._style_combo = QComboBox()
-        self._style_combo.addItems(list(self._styles))
-        self._style_combo.currentTextChanged.connect(self._on_style_changed)
-        form.addRow("Style:", self._style_combo)
+        copy_btn = QPushButton(icon("save_as"), " Copy style from…")
+        copy_btn.setToolTip(
+            "Copy another figure's style — or a named style saved in "
+            "plot_specs.yaml — over this figure's. Each figure owns its "
+            "style; this is how a shared look is applied deliberately.")
+        copy_btn.clicked.connect(self._copy_style_from)
+        form.addRow("Style:", copy_btn)
 
         card.add_body(form)
         return card
@@ -594,7 +649,10 @@ class PlotEditorWindow(QMainWindow):
 
     @property
     def style(self) -> pf.PlotStyle:
-        return self._styles.get(self._style_combo.currentText(), pf.BUILTIN_STYLE)
+        """The CURRENT figure's own working style — never a shared object."""
+        if self._current_id and self._current_id in self._plot_styles:
+            return self._plot_styles[self._current_id]
+        return pf.BUILTIN_STYLE
 
     def _load_spec_into_form(self) -> None:
         spec = self.spec
@@ -608,6 +666,20 @@ class PlotEditorWindow(QMainWindow):
             widget.blockSignals(True)
             widget.setText(value)
             widget.blockSignals(False)
+        for check, lo, hi, limits in (
+                (self._xlim_check, self._xlim_lo, self._xlim_hi, spec.x_limits),
+                (self._ylim_check, self._ylim_lo, self._ylim_hi, spec.y_limits)):
+            pinned = bool(limits) and len(limits) == 2
+            for widget in (check, lo, hi):
+                widget.blockSignals(True)
+            check.setChecked(pinned)
+            if pinned:
+                lo.setValue(float(limits[0]))
+                hi.setValue(float(limits[1]))
+            lo.setEnabled(pinned)
+            hi.setEnabled(pinned)
+            for widget in (check, lo, hi):
+                widget.blockSignals(False)
         for widget in (self._ref_check, self._reference_line):
             widget.blockSignals(True)
         self._ref_check.setChecked(spec.reference_line is not None)
@@ -616,10 +688,6 @@ class PlotEditorWindow(QMainWindow):
         self._reference_line.setEnabled(spec.reference_line is not None)
         for widget in (self._ref_check, self._reference_line):
             widget.blockSignals(False)
-        self._style_combo.blockSignals(True)
-        self._style_combo.setCurrentText(
-            spec.style if spec.style in self._styles else self._default_style)
-        self._style_combo.blockSignals(False)
         self._load_style_into_form()
 
     #: form attribute -> style field, for the three kinds of control that
@@ -711,7 +779,15 @@ class PlotEditorWindow(QMainWindow):
             spec.facet_by = self._facet_by.text()
             spec.reference_line = (self._reference_line.value()
                                    if self._ref_check.isChecked() else None)
-            spec.style = self._style_combo.currentText()
+            ## Sorted, so a lo/hi typed the wrong way round pins the range
+            ## rather than silently inverting the axis.
+            spec.x_limits = (sorted((self._xlim_lo.value(),
+                                     self._xlim_hi.value()))
+                             if self._xlim_check.isChecked() else [])
+            spec.y_limits = (sorted((self._ylim_lo.value(),
+                                     self._ylim_hi.value()))
+                             if self._ylim_check.isChecked() else [])
+            spec.style = spec.plot_id      # each figure owns its style
         for attr, field_name in self._NUMBERS:
             setattr(style, field_name, getattr(self, attr).value())
         for attr, field_name in self._FLAGS:
@@ -771,8 +847,33 @@ class PlotEditorWindow(QMainWindow):
                 widget.setEnabled(enabled)
         self._facet_by.setEnabled(kind.faceted)
 
-    def _on_style_changed(self, _name: str) -> None:
+    def _copy_style_from(self) -> None:
+        """Overwrite this figure's style with another's, chosen by name."""
+        import copy as _copy
+
+        from PyQt6.QtWidgets import QInputDialog
+
+        current = self._current_id
+        sources: dict[str, pf.PlotStyle] = {}
+        for plot_id, style in self._plot_styles.items():
+            if plot_id != current:
+                sources[f"{plot_id} (figure)"] = style
+        for name, style in self._project_specs.styles.items():
+            sources.setdefault(f"{name} (saved style)", style)
+        if not sources:
+            self._say("No other style to copy from yet.")
+            return
+        choice, ok = QInputDialog.getItem(
+            self, "Copy style", f"Copy which style over {current}'s?",
+            list(sources), 0, False)
+        if not ok or not choice:
+            return
+        copied = _copy.deepcopy(sources[choice])
+        copied.name = current
+        self._plot_styles[current] = copied
         self._load_style_into_form()
+        self._refresh_preview()
+        self._say(f"{current}: style copied from {choice}.")
         self._refresh_preview()
 
     def _preview_dpi(self, style) -> int:
@@ -881,39 +982,40 @@ class PlotEditorWindow(QMainWindow):
         exactly what the user has said "save" over, which is the sister
         app's rule.
         """
+        import copy as _copy
+
         spec, style = self._harvest()
         if spec is None:
             return
         self._project_specs.plots[spec.plot_id] = spec
-        ## The spec is not complete without the look it names: a spec saved
-        ## against an unsaved style would render with the stale copy on disk.
-        self._project_specs.styles[style.name] = style
+        ## The spec and the style it names travel together, under the
+        ## figure's own name: "each plot type, when saved, saves its own
+        ## style and spec parameters". A deep copy, so later edits in the
+        ## form cannot mutate what the file was told.
+        self._project_specs.styles[spec.plot_id] = _copy.deepcopy(style)
         path = pf.save_project_specs(self._specs_root, self._project_specs)
-        self._say(f"Saved {spec.plot_id} (spec + style {style.name!r}) to "
-                  f"{path}.")
-
-    def _save_style(self) -> None:
-        self._harvest()
-        self._project_specs.styles = dict(self._styles)
-        self._project_specs.default_style = self._style_combo.currentText()
-        path = pf.save_project_specs(self._specs_root, self._project_specs)
-        self._say(f"Saved styles to {path} — every member's figures use them.")
+        self._say(f"Saved {spec.plot_id} (spec + its style) to {path}.")
 
     def _export(self) -> None:
+        """Write the current figure to the container's ``figures/`` — no
+        dialog.
+
+        The destination is not a choice: publication figures have a home
+        (``<container>/figures/``, the sister app's convention), and a picker
+        for a fixed destination was four clicks of ceremony per export. The
+        file is named for the plot; a name already taken gets ``_1``, ``_2``…
+        — an export never overwrites, so two iterations of a figure can sit
+        side by side for comparison.
+        """
         spec, style = self._harvest()
         if spec is None:
             return
-        default = self.experiment.figures_dir / f"{spec.plot_id}.svg"
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export figure", str(default),
-            "Vector (*.svg *.pdf);;Raster (*.png)")
-        if not path:
-            return
+        target = _free_path(self._specs_root / "figures", spec.plot_id, "svg")
         try:
             g = pf.build_ggplot(
                 pf.data_for(self.experiment, spec, self._lifetables),
                 spec, style)
-            written = pf.save_figure(g, path, style)
+            written = pf.save_figure(g, target, style)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "Plot Editor", f"Export failed: {exc}")
             return

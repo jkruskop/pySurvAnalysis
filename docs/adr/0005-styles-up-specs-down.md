@@ -40,3 +40,12 @@ What survives of the original decision:
 * **Legacy per-member Specs are adopted, not ignored** — lifted into the
   container on first contact, losing to an explicit container Spec for the
   same plot id (`adopt_legacy_member_specs`).
+
+**Second amendment: a Style belongs to one figure.** The named, shared Style
+library ("Styles resolve upward") did not survive use either: with every Spec
+referencing `default`, changing the mortality plot's line width silently
+restyled the KM curves, and nothing per-figure could ever be recorded. Saving
+a figure now writes its spec *and* a style under the figure's own name;
+sharing a look is the explicit *Copy style from…*. `default_style` remains as
+the seed a figure's working style is copied from, and legacy specs naming a
+shared style still resolve through it.

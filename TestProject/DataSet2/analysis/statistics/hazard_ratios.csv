@@ -1,7 +1,0 @@
-group1,group2,hazard_ratio,hr_ci_lo,hr_ci_hi
-Female/20x,Female/40x,0.9004,0.8313,0.9751
-Female/20x,Male/20x,0.402,0.3625,0.4459
-Female/20x,Male/40x,0.3868,0.3587,0.4172
-Female/40x,Male/20x,0.4281,0.3873,0.4732
-Female/40x,Male/40x,0.4015,0.3739,0.4312
-Male/20x,Male/40x,0.8338,0.7712,0.9015

@@ -76,6 +76,13 @@ framing, which ADR-0001 forbids.
 * **Experiment Types contribute Hub buttons and script actions** (ADR-0002).
   This idea originates here; upstream has a fixed registry because it has one
   Experiment Type. It is the first thing to backport.
+* **Styles are per-figure, not a named shared library.** Upstream's styles
+  are named and reusable, with one `default_style` many plots reference; here
+  each saved figure carries a style under its own name, and reuse is the
+  explicit *Copy style from…*. Direct experience showed the shared object was
+  a trap: editing one plot's look silently restyled every other plot
+  referencing the same name. `default_style` survives as the seed for a
+  figure's first edit, and old files that reference it still resolve.
 * **The style vocabulary differs where the figure does.** Upstream styles a
   jittered dot/box plot: `jitter_width`, `mean_style`, `mean_color`, `geom`,
   `p_value_pt`, `facet_width_mm`/`facet_height_mm`. Here the equivalents are

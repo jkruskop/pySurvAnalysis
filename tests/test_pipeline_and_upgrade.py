@@ -156,3 +156,23 @@ def test_upgrading_an_upgraded_directory_is_a_no_op(tmp_path):
     upgrade.apply(upgrade.plan(directory))
     assert not upgrade.needs_upgrade(directory)
     assert upgrade.plan(directory).is_noop
+
+
+def test_the_analysis_figures_raise_no_warnings(tmp_path):
+    """The risk-table figure warned that tight_layout 'results might be
+    incorrect' on every run — its layout is hand-tuned, so nothing is left
+    for tight_layout to guess at."""
+    import warnings
+
+    from pysurvanalysis import lifetable, plotting
+    from tests.conftest import make_experiment_dir
+    from pysurvanalysis.domain import SurvivalExperiment
+
+    directory = make_experiment_dir(tmp_path / "e", type_key="standard_lifespan")
+    data, _factors = SurvivalExperiment(directory).load()
+    tables = lifetable.compute_lifetables(data)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        figure = plotting.plot_km_with_risk_table(tables)
+    assert [str(w.message) for w in caught] == []
+    assert figure.axes                       # both panels are really there

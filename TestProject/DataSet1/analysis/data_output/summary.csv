@@ -1,5 +1,0 @@
-treatment,n_individuals,n_deaths,n_censored,pct_censored
-Female/20x,900,20,880,97.8
-Female/40x,1900,102,1798,94.6
-Male/20x,900,70,830,92.2
-Male/40x,1900,585,1315,69.2

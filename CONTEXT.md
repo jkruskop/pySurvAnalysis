@@ -85,9 +85,10 @@ answering two different questions (ADR-0010). **What state is the folder in?**
 — it does not exist (**Create experiment…**), its directory is in the Project
 but has no config (**Initialize existing directory…**), or it is a member
 already (the table, and **Experiment configs…** for the bulk view). **Where
-does it come from?** — ADR-0008's two ways in from outside: an existing
-directory adopted (copied in unless it is already a child), or one built
-around a single DLife workbook (moved in if it was already loose in the
+does it come from?** — ADR-0008's two ways in from outside, and the Hub keeps
+them strictly outside: an existing directory copied in (**Add directory**
+refuses a folder already in the Project, naming Initialize instead), or one
+built around a single DLife workbook (moved in if it was already loose in the
 Project tree, copied otherwise).
 _Avoid_: replicate (implies same-design repeats and pooling — the very thing
 this app does not do), arm, variant
@@ -162,8 +163,11 @@ contributes.
 _Avoid_: report figure, plot export
 
 **Plot Style**:
-A named, reusable look shared by every Publication Figure that references it,
-edited in the Plot Editor's four style cards: **canvas and type** (size,
+One figure's look, **owned by that figure**: saving a figure writes its spec
+and its style together, under the figure's own name, so editing the mortality
+plot's line width never restyles the KM curves. A shared look is applied
+deliberately, with the Figure card's *Copy style from…* (another figure, or
+any named style in the file). Edited in the Plot Editor's four style cards: **canvas and type** (size,
 theme, font family, base size, a per-element point size for title / axis
 titles / ticks / legend / strips, and one text colour for all of them),
 **curves and points** (curve width, the separate weight of the axis
@@ -172,8 +176,12 @@ outline, censor ticks, the confidence band), **panels and legend** (panel
 fill and border, gridlines, facet-strip style and fill, legend position, the
 At-Risk Band's size and times), and **colours** (a per-curve assignment, over
 a fallback cycle). Every per-element size defaults to 0 = *follow the base*,
-so a style that sets only `base_size` still scales as one thing.
-_Avoid_: theme (a plotnine theme is one field inside a style)
+so a style that sets only `base_size` still scales as one thing. Axis
+**limits** are Spec fields, not Style: pinning a range is a per-figure
+editorial decision, optional per axis behind a checkbox.
+_Avoid_: theme (a plotnine theme is one field inside a style), shared default
+style (the superseded model — `default_style` survives only as the seed for a
+figure's first edit)
 
 **Plot Spec**:
 One Publication Figure's content decisions — axis labels, treatment and facet

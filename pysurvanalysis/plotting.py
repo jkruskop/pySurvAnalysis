@@ -305,7 +305,11 @@ def plot_km_with_risk_table(
         spine.set_visible(False)
     ax_risk.spines["bottom"].set_visible(True)
 
-    fig.tight_layout()
+    ## Not tight_layout: it warns "Axes not compatible … results might be
+    ## incorrect" over this GridSpec pair and then guesses. The layout is
+    ## already hand-tuned (height_ratios + hspace above), so only the outer
+    ## margins are left to set.
+    fig.subplots_adjust(left=0.10, right=0.97, top=0.93, bottom=0.09)
     return fig
 
 

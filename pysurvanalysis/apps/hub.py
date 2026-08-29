@@ -25,11 +25,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from ..gui_env import sanitize_input_method_environment
+from ..gui_env import sanitize_input_method_environment, use_agg_matplotlib
 
 ## Before Qt is imported, not after: the overrides are read when the
 ## platform plugin initialises.
 sanitize_input_method_environment()
+use_agg_matplotlib()
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction, QBrush
@@ -442,10 +443,11 @@ class HubWindow(QMainWindow):
         grid.setVerticalSpacing(8)
         adopt_dir = ActionButton("Add directory…", Category.NEUTRAL,
                                  icon_name="open")
-        adopt_dir.setToolTip("Take an existing experiment directory (with a "
-                             "data/ folder) into this Project. One from "
-                             "outside is copied in — the Project owns its "
-                             "members' data.")
+        adopt_dir.setToolTip("Copy an experiment directory from OUTSIDE the "
+                             "Project in (it needs a data/ folder with a "
+                             "DLife workbook) — the Project owns its members' "
+                             "data. A folder already inside the Project is "
+                             "'Initialize existing directory…'s job instead.")
         adopt_dir.clicked.connect(self._action_add_directory)
         adopt_file = ActionButton("Add experiment…", Category.NEUTRAL,
                                   icon_name="excel")
@@ -1932,11 +1934,25 @@ class HubWindow(QMainWindow):
             self._warn("Create or select a Project first.")
             return
         path = QFileDialog.getExistingDirectory(
-            self, "Add an existing experiment directory", str(self._project.directory))
+            self, "Add an experiment directory from outside the Project",
+            str(self._project.directory.parent))
         if not path:
             return
+        chosen = Path(path).resolve()
+        ## Strictly the way in from OUTSIDE (ADR-0010): a folder already in
+        ## the Project is the other button's state, and letting this one take
+        ## it too meant two buttons covering one case with different rules —
+        ## this one refuses an empty folder or a bare CSV that Initialize
+        ## handles fine.
+        if chosen.parent == self._project.directory:
+            self._warn(
+                f"'{chosen.name}' is already in this Project.\n\nUse "
+                "'Initialize existing directory…' to make a folder that is "
+                "already here a member — Add directory is for copying one in "
+                "from outside.")
+            return
         try:
-            member = self._project.adopt_directory(path)
+            member = self._project.adopt_directory(chosen)
         except (ProjectError, OSError) as exc:
             self._warn(str(exc))
             return

@@ -316,3 +316,25 @@ def test_the_median_reference_is_seeded_only_on_survival_axes():
     for pid in ("nelson_aalen", "mortality", "hazard", "number_at_risk",
                 "hazard_ratio_forest", "survival_distribution"):
         assert pf.default_spec(pid).reference_line is None, pid
+
+
+def test_axis_limits_reach_every_numeric_axis(project):
+    """Limits are honoured wherever the axis is numeric — including the
+    forest's log ratio axis (positive values only; log10(0) has no where) and
+    the distribution, where coord_cartesian zooms without re-estimating the
+    densities a scale limit would silently re-shape."""
+    member = project.member("rep_a")
+    member.run_analysis()
+    for plot_id, x_limits, y_limits in (
+            ("km_curves", [0.0, 40.0], [0.0, 0.8]),
+            ("hazard_ratio_forest", [0.1, 10.0], []),
+            ("survival_distribution", [0.0, 60.0], []),
+            ("interaction_lifespan", [], [0.0, 80.0])):
+        spec = pf.default_spec(plot_id)
+        spec.x_limits, spec.y_limits = x_limits, y_limits
+        frame = pf.data_for(member, spec)
+        if frame.empty:
+            continue
+        style = pf.PlotStyle()
+        assert pf.render_png_bytes(pf.build_ggplot(frame, spec, style),
+                                   style, dpi=60), plot_id
