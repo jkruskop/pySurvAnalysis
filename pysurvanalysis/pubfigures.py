@@ -198,101 +198,340 @@ BUILTIN_STYLE = PlotStyle()
 
 
 def default_spec(plot_id: str = "km", time_label: str = "Age") -> PlotSpec:
-    """A sensible starting Spec for a survivorship figure."""
-    return PlotSpec(plot_id=plot_id, x_label=time_label,
-                    title="", reference_line=0.5)
+    """A sensible starting Spec for one figure.
+
+    The median-survival reference (0.5) is seeded only where the y axis is a
+    survival probability — on a hazard rate or a count it marks nothing, and
+    the checkbox that now governs the line should start unchecked there.
+    """
+    kind = PLOT_KINDS.get(plot_id, PLOT_KINDS["km_curves"])
+    survivalish = kind.y == "km_lx"
+    ## Axis labels come from the KIND, not the PlotSpec class default: a
+    ## mortality spec born saying "Survival probability" renders with the
+    ## wrong axis, and the class default is a KM label.
+    x_label = f"log({time_label})" if kind.x == "log_time" else time_label
+    return PlotSpec(plot_id=plot_id, x_label=x_label,
+                    y_label=kind.y_label or "Survival probability", title="",
+                    reference_line=0.5 if survivalish else None)
 
 
 # ---------------------------------------------------------------------------
 # Reading and writing the two files
 # ---------------------------------------------------------------------------
 
-def load_styles(project_dir: str | Path | None) -> tuple[dict[str, PlotStyle], str]:
-    """A Project's Style library and the name of its default."""
-    if project_dir is None:
-        return {"default": BUILTIN_STYLE}, "default"
-    data = cfgmod.read_yaml(Path(project_dir) / cfgmod.SPECS_FILENAME)
-    raw = data.get("styles") or {}
-    styles = {name: PlotStyle.from_dict(name, body) for name, body in raw.items()
-              if isinstance(body, dict)}
-    styles.setdefault("default", BUILTIN_STYLE)
-    default_name = str(data.get("default_style") or "default")
-    if default_name not in styles:
-        default_name = "default"
-    return styles, default_name
+@dataclass
+class ProjectSpecs:
+    """The parsed ``plot_specs.yaml``: the Style library, the default Style,
+    and the per-plot Specs.
+
+    **Both halves live in one file at the container** — the Project when there
+    is one, the Experiment Directory itself for a standalone (ADR-0003). That
+    is the sister app's model, adopted here: a Spec is as much a shared
+    editorial decision as a Style (the same axis labels, the same treatment
+    order, the same reference line across every member), and splitting them
+    meant curating one figure per member by hand.
+    """
+
+    default_style: str = "default"
+    styles: dict[str, PlotStyle] = field(default_factory=dict)
+    plots: dict[str, PlotSpec] = field(default_factory=dict)
+
+    def style_for(self, spec: PlotSpec) -> PlotStyle:
+        return (self.styles.get(spec.style)
+                or self.styles.get(self.default_style)
+                or BUILTIN_STYLE)
+
+    def ensure_default_style(self) -> None:
+        if not self.styles:
+            self.styles["default"] = PlotStyle()
+        if self.default_style not in self.styles:
+            self.default_style = next(iter(self.styles))
 
 
-def save_styles(project_dir: str | Path, styles: dict[str, PlotStyle],
+def specs_root(experiment) -> Path:
+    """Where *experiment*'s ``plot_specs.yaml`` lives.
+
+    The Project, so every member shares one library — or the experiment's own
+    directory when it has no Project, which the sister app never has to
+    handle because a replicate there cannot exist outside one (ADR-0003).
+    """
+    project = getattr(experiment, "project", None)
+    if project is not None:
+        return Path(project.directory)
+    return Path(experiment.directory)
+
+
+def load_project_specs(root: str | Path | None) -> ProjectSpecs:
+    """Read a container's ``plot_specs.yaml``."""
+    if root is None:
+        specs = ProjectSpecs()
+        specs.ensure_default_style()
+        return specs
+    raw = cfgmod.read_yaml(Path(root) / cfgmod.SPECS_FILENAME)
+    specs = ProjectSpecs(
+        default_style=str(raw.get("default_style") or "default"),
+        styles={str(k): PlotStyle.from_dict(str(k), v)
+                for k, v in (raw.get("styles") or {}).items()
+                if isinstance(v, dict)},
+        plots={str(k): PlotSpec.from_dict(str(k), v)
+               for k, v in (raw.get("plots") or {}).items()
+               if isinstance(v, dict) and str(k) in PLOT_TYPES},
+    )
+    specs.plots = migrate_specs(specs.plots)
+    specs.ensure_default_style()
+    return specs
+
+
+def save_project_specs(root: str | Path, specs: ProjectSpecs) -> Path:
+    """Write both halves back to the container's ``plot_specs.yaml``.
+
+    Unknown top-level keys are preserved, the way a config write is: this file
+    is hand-editable and a future version may add to it.
+    """
+    specs.ensure_default_style()
+    path = Path(root) / cfgmod.SPECS_FILENAME
+    data = cfgmod.read_yaml(path)
+    data["default_style"] = specs.default_style
+    data["styles"] = {k: v.to_dict() for k, v in specs.styles.items()}
+    data["plots"] = {k: v.to_dict() for k, v in specs.plots.items()}
+    return cfgmod.write_yaml(path, data)
+
+
+def adopt_legacy_member_specs(experiment) -> ProjectSpecs:
+    """The container's specs, plus any a member curated under the old layout.
+
+    Specs used to be written into the *member's* own ``plot_specs.yaml``.
+    Those are real curation, so they are lifted into the container rather
+    than ignored — but only for plot ids the container has no Spec for, since
+    a Spec chosen for the whole Project outranks one inherited from whichever
+    member happens to be opened first.
+    """
+    root = specs_root(experiment)
+    specs = load_project_specs(root)
+    own_dir = Path(experiment.directory)
+    if own_dir == root:
+        return specs
+    legacy = load_project_specs(own_dir).plots
+    for plot_id, spec in legacy.items():
+        specs.plots.setdefault(plot_id, spec)
+    return specs
+
+
+# ── the older, narrower API, kept for callers that ask one question ────────
+
+def load_styles(root: str | Path | None) -> tuple[dict[str, PlotStyle], str]:
+    """A container's Style library and the name of its default."""
+    specs = load_project_specs(root)
+    return specs.styles, specs.default_style
+
+
+def save_styles(root: str | Path, styles: dict[str, PlotStyle],
                 default_style: str = "default") -> Path:
-    path = Path(project_dir) / cfgmod.SPECS_FILENAME
-    data = cfgmod.read_yaml(path)
-    data["styles"] = {name: style.to_dict() for name, style in styles.items()}
-    data["default_style"] = default_style
-    return cfgmod.write_yaml(path, data)
+    specs = load_project_specs(root)
+    specs.styles = dict(styles)
+    specs.default_style = default_style
+    return save_project_specs(root, specs)
 
 
-def load_specs(experiment_dir: str | Path) -> dict[str, PlotSpec]:
-    """An Experiment Directory's Specs, keyed by plot id."""
-    data = cfgmod.read_yaml(Path(experiment_dir) / cfgmod.SPECS_FILENAME)
-    raw = data.get("plots") or {}
-    return {pid: PlotSpec.from_dict(pid, body) for pid, body in raw.items()
-            if isinstance(body, dict)}
+def load_specs(root: str | Path) -> dict[str, PlotSpec]:
+    """A container's Specs, keyed by plot id."""
+    return load_project_specs(root).plots
 
 
-def save_specs(experiment_dir: str | Path, specs: dict[str, PlotSpec]) -> Path:
-    path = Path(experiment_dir) / cfgmod.SPECS_FILENAME
-    data = cfgmod.read_yaml(path)
-    data["plots"] = {pid: spec.to_dict() for pid, spec in specs.items()}
-    return cfgmod.write_yaml(path, data)
+def save_specs(root: str | Path, specs: dict[str, PlotSpec]) -> Path:
+    project_specs = load_project_specs(root)
+    project_specs.plots = dict(specs)
+    return save_project_specs(root, project_specs)
+
+
+def migrate_specs(specs: dict[str, PlotSpec]) -> dict[str, PlotSpec]:
+    """Fold retired Spec ids onto the ones that replaced them.
+
+    A Spec saved under a retired id still holds the labels and treatment
+    order somebody curated; dropping it would silently discard that work, and
+    keeping it would show the duplicate this rename exists to remove. It is
+    only adopted when the surviving id has no Spec of its own — an explicit
+    one always wins over an inherited alias.
+    """
+    out = dict(specs)
+    for old_id, new_id in _SPEC_ALIASES.items():
+        spec = out.pop(old_id, None)
+        if spec is not None and new_id not in out:
+            spec.plot_id = new_id
+            out[new_id] = spec
+    return out
 
 
 def resolve_style(name: str, experiment) -> PlotStyle:
-    """Resolve a style name upward: member file → Project file → built-in."""
-    own, _ = load_styles(experiment.directory)
-    if name in own and name != "default":
-        return own[name]
-    project = getattr(experiment, "project", None)
-    if project is not None:
-        shared, default_name = load_styles(project.directory)
-        if name in shared:
-            return shared[name]
-        if name == "default":
-            return shared.get(default_name, BUILTIN_STYLE)
-    return own.get(name, BUILTIN_STYLE)
+    """Resolve a style name at the container, then the built-in.
+
+    One lookup now, not two: with both halves in the container's file there is
+    no member-level library to fall back from.
+    """
+    specs = load_project_specs(specs_root(experiment))
+    if name in specs.styles:
+        return specs.styles[name]
+    return specs.styles.get(specs.default_style, BUILTIN_STYLE)
 
 
 def specs_for(experiment) -> dict[str, PlotSpec]:
-    """The Specs to offer for an experiment: saved ones, plus its Plot Set."""
-    saved = load_specs(experiment.directory)
+    """The Specs to offer for an experiment: the container's, plus defaults
+    for every plot in its Experiment Type's Plot Set that has none yet."""
+    specs = adopt_legacy_member_specs(experiment)
+    return fill_default_specs(specs.plots, experiment)
+
+
+def fill_default_specs(saved: dict[str, PlotSpec], experiment) -> dict[str, PlotSpec]:
+    """*saved*, plus a default Spec for every renderable plot in the type's
+    Plot Set that has none."""
     time_label = experiment.type.resolve_time_label(experiment.config)
+    factors = list((experiment.config.get("factors") or {}))
+    out = dict(saved)
     for plot_id in (experiment.type.plot_ids() or ("km_curves",)):
-        if plot_id in _CURVE_PLOTS and plot_id not in saved:
-            spec = default_spec(plot_id, time_label)
-            if plot_id == "km_faceted":
-                factors = list((experiment.config.get("factors") or {}))
-                spec.facet_by = factors[0] if factors else ""
-                if len(factors) > 1:
-                    spec.series_label = factors[1]
-            saved[plot_id] = spec
-    return saved
+        plot_id = _SPEC_ALIASES.get(plot_id, plot_id)
+        if plot_id not in PLOT_TYPES or plot_id in out:
+            continue
+        spec = default_spec(plot_id, time_label)
+        if PLOT_KINDS[plot_id].faceted:
+            spec.facet_by = factors[0] if factors else ""
+            if len(factors) > 1:
+                spec.series_label = factors[1]
+        out[plot_id] = spec
+    return out
 
 
-#: Plot ids the publication renderer can draw. Diagnostics (log-log, forest)
-#: stay matplotlib-only: they are for the analyst, not the journal.
-_CURVE_PLOTS = ("km_curves", "km_risk_table", "km_faceted")
+# ---------------------------------------------------------------------------
+# What each plot is made of
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class PlotKind:
+    """How one plot id is drawn: where its data comes from, what is on the y
+    axis, and which of the Style's features mean anything for it.
+
+    ``supports`` is what makes the editor honest. A censor tick on a hazard
+    curve or an at-risk band under a forest plot is not a setting anybody
+    wants greyed-in-but-ignored, so the controls that do not apply are
+    disabled rather than silently doing nothing.
+    """
+
+    source: str                 # lifetables | individual | hazard_ratios
+    geom: str                   # step | line | forest | distribution | interaction
+    y: str = ""                 # lifetable column, for the series geoms
+    y_label: str = ""
+    #: x column. ``log_time`` for the log-log diagnostic, which is the one
+    #: plot whose x axis is a transform rather than the time itself.
+    x: str = "time"
+    #: (lower, upper) lifetable columns for the confidence band, when the
+    #: estimator publishes one.
+    ci: tuple[str, str] | None = None
+    #: (x, y) knot prepended to every series, or None when the plot has no
+    #: natural origin — survivorship starts at 1, cumulative hazard at 0, but
+    #: an interval rate has no value before the first interval.
+    origin: tuple[float, float] | None = None
+    faceted: bool = False
+    supports: frozenset = frozenset()
+
+
+#: Everything the Style can offer, per feature, so a kind names what it uses.
+_CI = "ci"; _CENSOR = "censor"; _RISK = "risk"; _POINTS = "points"
+_SERIES_FEATURES = frozenset({_POINTS})
+_KM_FEATURES = frozenset({_CI, _CENSOR, _RISK, _POINTS})
+
+PLOT_KINDS: dict[str, PlotKind] = {
+    "km_curves": PlotKind("lifetables", "step", "km_lx", "Survival probability",
+                          origin=(0.0, 1.0), ci=("km_ci_lo", "km_ci_hi"),
+                          supports=_KM_FEATURES),
+    "km_faceted": PlotKind("lifetables", "step", "km_lx", "Survival probability",
+                           origin=(0.0, 1.0), ci=("km_ci_lo", "km_ci_hi"),
+                           faceted=True, supports=_KM_FEATURES),
+    "nelson_aalen": PlotKind("lifetables", "step", "na_H",
+                             "Cumulative hazard", origin=(0.0, 0.0),
+                             ci=("na_ci_lo", "na_ci_hi"),
+                             supports=_SERIES_FEATURES | {_CI}),
+    "number_at_risk": PlotKind("lifetables", "step", "n_at_risk",
+                               "Individuals at risk",
+                               supports=_SERIES_FEATURES),
+    "cumulative_events": PlotKind("lifetables", "step", "cum_deaths",
+                                  "Cumulative deaths", origin=(0.0, 0.0),
+                                  supports=_SERIES_FEATURES),
+    "mortality": PlotKind("lifetables", "line", "qx",
+                          "Mortality (qx)", supports=_SERIES_FEATURES),
+    "hazard": PlotKind("lifetables", "line", "hx", "Hazard rate",
+                       supports=_SERIES_FEATURES),
+    "smoothed_hazard": PlotKind("lifetables", "line", "hx_smooth",
+                                "Smoothed hazard", supports=_SERIES_FEATURES),
+    "log_log": PlotKind("lifetables", "step", "log_neg_log",
+                        "log(−log S(t))", x="log_time",
+                        supports=_SERIES_FEATURES),
+    "survival_distribution": PlotKind("individual", "distribution",
+                                      y_label="Density"),
+    "hazard_ratio_forest": PlotKind("hazard_ratios", "forest",
+                                    y_label="Comparison"),
+    "interaction_lifespan": PlotKind("individual", "interaction",
+                                     y_label="Median lifespan"),
+}
+
+#: Plot ids the publication renderer can draw — the whole Plot Set of every
+#: Experiment Type, so anything the Plots panel offers can also be curated.
+PLOT_TYPES: tuple[str, ...] = tuple(PLOT_KINDS)
+
+#: Saved Specs whose id no longer exists, and what they become.
+#:
+#: ``km_risk_table`` was a second name for ``km_curves``. On the matplotlib
+#: side it is a real second figure (``plot_km_with_risk_table`` against
+#: ``plot_km_curves``), but here the At-Risk Band is a **Style** toggle, so
+#: the two rendered byte-identical output and differed in nothing but a name.
+#: The Spec's content decisions are still wanted; only its id was a duplicate.
+_SPEC_ALIASES = {"km_risk_table": "km_curves"}
 
 
 # ---------------------------------------------------------------------------
 # Data preparation
 # ---------------------------------------------------------------------------
 
-def curve_data(lifetables: pd.DataFrame, spec: PlotSpec) -> pd.DataFrame:
-    """Step-function coordinates for every curve, t=0 anchored at S=1.
+def kind_for(spec_or_id) -> PlotKind:
+    """The :class:`PlotKind` for a Spec or a plot id, defaulting to the KM
+    curve so an unknown id renders as something rather than raising."""
+    plot_id = getattr(spec_or_id, "plot_id", spec_or_id)
+    return PLOT_KINDS.get(str(plot_id), PLOT_KINDS["km_curves"])
 
-    plotnine's ``geom_step`` needs the origin point explicitly; without it the
-    first curve segment starts at the first death and the figure silently lies
-    about early survival.
+
+def _derived(grp: pd.DataFrame, kind: PlotKind, smoothing: float = 3.0) -> pd.DataFrame:
+    """Add whatever column *kind* wants that the lifetable does not carry."""
+    grp = grp.sort_values("time").copy()
+    if kind.y == "cum_deaths":
+        grp["cum_deaths"] = grp["n_deaths"].cumsum()
+    elif kind.y == "hx_smooth":
+        ## The same Gaussian kernel and bandwidth the analyst figure uses
+        ## (``plotting.plot_smoothed_hazard``), so the publication figure is
+        ## the same estimate in a different coat — not a second one.
+        from scipy.ndimage import gaussian_filter1d
+
+        values = grp["hx"].to_numpy(dtype=float)
+        grp["hx_smooth"] = (gaussian_filter1d(values, sigma=smoothing)
+                            if len(values) >= 5 else values)
+    elif kind.y == "log_neg_log":
+        ## Defined only where survival is strictly between 0 and 1 and time is
+        ## positive: log(0) and log(-log(1)) are both infinite, and a curve
+        ## running off to infinity is not a diagnostic.
+        grp = grp[(grp["km_lx"] > 0) & (grp["km_lx"] < 1) & (grp["time"] > 0)]
+        grp = grp.copy()
+        grp["log_neg_log"] = np.log(-np.log(grp["km_lx"].to_numpy(dtype=float)))
+        grp["log_time"] = np.log(grp["time"].to_numpy(dtype=float))
+    return grp
+
+
+def series_data(lifetables: pd.DataFrame, spec: PlotSpec,
+                kind: PlotKind | None = None) -> pd.DataFrame:
+    """Per-treatment ``(x, value)`` knots for one series-shaped plot.
+
+    One preparation for nine plots: they differ in which lifetable column is
+    on the y axis, whether there is a value before the first event, and
+    whether the estimator publishes a confidence band — not in how the series
+    are selected, ordered, renamed or facetted.
     """
+    kind = kind or kind_for(spec)
     lt = lifetables.copy()
     lt["treatment"] = lt["treatment"].astype(str)
     wanted = [t for t in (spec.treatments or [])
@@ -300,24 +539,39 @@ def curve_data(lifetables: pd.DataFrame, spec: PlotSpec) -> pd.DataFrame:
 
     frames: list[pd.DataFrame] = []
     for treatment in wanted:
-        grp = lt[lt["treatment"] == treatment].sort_values("time")
+        grp = _derived(lt[lt["treatment"] == treatment], kind)
         if grp.empty:
             continue
+        x = grp[kind.x].to_numpy(dtype=float)
+        y = grp[kind.y].to_numpy(dtype=float)
+        lo, hi = ((grp[kind.ci[0]].to_numpy(dtype=float),
+                   grp[kind.ci[1]].to_numpy(dtype=float)) if kind.ci
+                  else (y, y))
+        censored = grp["n_censored"].to_numpy()
+        risk = grp["n_at_risk"].to_numpy()
+
+        if kind.origin is not None:
+            ## plotnine's geom_step needs the origin point explicitly; without
+            ## it the first segment starts at the first event and the figure
+            ## silently lies about what happened before it.
+            ox, oy = kind.origin
+            x = np.concatenate([[ox], x])
+            y = np.concatenate([[oy], y])
+            lo = np.concatenate([[oy], lo])
+            hi = np.concatenate([[oy], hi])
+            censored = np.concatenate([[0], censored])
+            risk = np.concatenate([[risk[0] if len(risk) else 0], risk])
+
         block = pd.DataFrame({
-            "time": np.concatenate([[0.0], grp["time"].to_numpy()]),
-            "surv": np.concatenate([[1.0], grp["km_lx"].to_numpy()]),
-            "ci_lo": np.concatenate([[1.0], grp["km_ci_lo"].to_numpy()]),
-            "ci_hi": np.concatenate([[1.0], grp["km_ci_hi"].to_numpy()]),
-            "n_censored": np.concatenate([[0], grp["n_censored"].to_numpy()]),
-            "n_risk": np.concatenate(
-                [[grp["n_at_risk"].iloc[0]], grp["n_at_risk"].to_numpy()]),
+            "time": x, "value": y, "ci_lo": lo, "ci_hi": hi,
+            "n_censored": censored, "n_risk": risk,
         })
         block["treatment"] = treatment
         block["label"] = spec.display_names.get(treatment, treatment)
         frames.append(block)
 
     if not frames:
-        return pd.DataFrame(columns=["time", "surv", "treatment", "label"])
+        return pd.DataFrame(columns=["time", "value", "treatment", "label"])
     data = pd.concat(frames, ignore_index=True)
     if spec.facet_by:
         parts = data["treatment"].str.split("/", n=1, expand=True)
@@ -325,6 +579,19 @@ def curve_data(lifetables: pd.DataFrame, spec: PlotSpec) -> pd.DataFrame:
             data["_facet"], data["_series"] = parts[0], parts[1]
             data["label"] = data["_series"]
     return data
+
+
+def curve_data(lifetables: pd.DataFrame, spec: PlotSpec) -> pd.DataFrame:
+    """Kaplan-Meier step coordinates — :func:`series_data` for a KM Spec.
+
+    Kept as its own name because it is what every KM caller asks for, and
+    because a Spec whose id is not a series plot at all must still get curve
+    coordinates when something asks for curves.
+    """
+    kind = kind_for(spec)
+    if kind.source != "lifetables":
+        kind = PLOT_KINDS["km_curves"]
+    return series_data(lifetables, spec, kind)
 
 
 def step_expand(data: pd.DataFrame, group_cols: tuple[str, ...] = ("treatment",),
@@ -382,9 +649,10 @@ def point_data(data: pd.DataFrame, style: PlotStyle,
     """The knots that get a marker, per :attr:`PlotStyle.point_at`.
 
     ``events`` is the useful default and the only one that needs deriving: a
-    knot is an event where survival actually fell, which excludes both the
-    t=0 anchor and the censoring-only knots — marking those would put a dot
-    where nobody died.
+    knot where the value actually **changed**, which excludes both the origin
+    and the censoring-only knots — marking those would put a dot where
+    nothing happened. On a survival curve that is exactly "where survival
+    fell", because survival never rises.
     """
     if data.empty:
         return data
@@ -399,8 +667,8 @@ def point_data(data: pd.DataFrame, style: PlotStyle,
     for _key, grp in (data.groupby(list(groups), sort=False) if groups
                       else [(None, data)]):
         grp = grp.sort_values("time")
-        fell = grp["surv"].diff() < 0
-        out.append(grp[fell])
+        changed = grp["value"].diff().fillna(0) != 0
+        out.append(grp[changed])
     return (pd.concat(out, ignore_index=True) if out
             else data.iloc[0:0])
 
@@ -451,30 +719,54 @@ def risk_band_data(data: pd.DataFrame, style: PlotStyle,
 # ---------------------------------------------------------------------------
 
 def build_ggplot(data: pd.DataFrame, spec: PlotSpec, style: PlotStyle):
-    """Assemble the plotnine figure for one Spec+Style."""
+    """The plotnine figure for one Spec+Style, dispatched on the plot's kind.
+
+    Four shapes cover the whole Plot Set: a series over time (nine plots), a
+    forest of ratios, a distribution of lifespans, and an interaction of
+    medians. They share the Style — the type, the palette, the panel
+    treatment — and diverge only in the layers.
+    """
+    if data is None or data.empty:
+        raise ValueError(f"No data for plot {spec.plot_id!r}.")
+    kind = kind_for(spec)
+    if kind.geom in ("step", "line"):
+        return _build_series(data, spec, style, kind)
+    if kind.geom == "forest":
+        return _build_forest(data, spec, style, kind)
+    if kind.geom == "distribution":
+        return _build_distribution(data, spec, style, kind)
+    return _build_interaction(data, spec, style, kind)
+
+
+def _series_column(data: pd.DataFrame) -> str:
+    return "_series" if "_series" in data.columns else "label"
+
+
+def _build_series(data: pd.DataFrame, spec: PlotSpec, style: PlotStyle,
+                  kind: PlotKind):
+    """Nine of the twelve plots: a step or a line per treatment over time."""
     import plotnine as p9
 
-    if data.empty:
-        raise ValueError(f"No curve data for plot {spec.plot_id!r}.")
-
-    series_col = "_series" if "_series" in data.columns else "label"
+    series_col = _series_column(data)
     labels = list(dict.fromkeys(data[series_col]))
     colours = style.colour_for(labels)
 
-    g = (p9.ggplot(data, p9.aes(x="time", y="surv", color=series_col))
-         + p9.geom_step(size=style.line_width))
+    line = p9.geom_step if kind.geom == "step" else p9.geom_line
+    g = (p9.ggplot(data, p9.aes(x="time", y="value", color=series_col))
+         + line(size=style.line_width))
     ## Both the band and filled points map `fill`, and plotnine warns and
     ## replaces when a scale is added twice — so the flag is set here and the
     ## single scale is added at the end.
     needs_fill_scale = False
 
-    if style.ci_band:
+    if style.ci_band and _CI in kind.supports:
         ## Stepped by expanding the data, not by a geom parameter: plotnine's
         ## geom_ribbon has no `step`/`direction`, and passing one is a hard
         ## error ("Parameters {'step'} are not understood by either the geom,
         ## stat or layer"), which is what this used to raise the moment anyone
         ## ticked the box.
-        band = step_expand(data, group_cols=(series_col, "_facet"))
+        band = (step_expand(data, group_cols=(series_col, "_facet"))
+                if kind.geom == "step" else data)
         g = g + p9.geom_ribbon(
             data=band,
             mapping=p9.aes(x="time", ymin="ci_lo", ymax="ci_hi",
@@ -486,17 +778,17 @@ def build_ggplot(data: pd.DataFrame, spec: PlotSpec, style: PlotStyle):
         )
         needs_fill_scale = True
 
-    if style.show_points:
+    if style.show_points and _POINTS in kind.supports:
         points = point_data(data, style, group_cols=(series_col, "_facet"))
         if len(points):
             layer, mapped_fill = _point_layer(points, style, series_col)
             g = g + layer
             needs_fill_scale = needs_fill_scale or mapped_fill
 
-    if style.censor_ticks:
+    if style.censor_ticks and _CENSOR in kind.supports:
         censored = data[(data["time"] > 0) & (data["n_censored"] > 0)]
         if len(censored):
-            mapping = {"x": "time", "y": "surv"}
+            mapping = {"x": "time", "y": "value"}
             kwargs: dict[str, Any] = {}
             if style.censor_color:
                 kwargs["color"] = style.censor_color
@@ -512,8 +804,8 @@ def build_ggplot(data: pd.DataFrame, spec: PlotSpec, style: PlotStyle):
         g = g + p9.geom_hline(yintercept=float(spec.reference_line),
                               linetype="dashed", color="#888888", size=0.4)
 
-    y_lo = 0.0
-    if style.risk_table:
+    y_lo = None
+    if style.risk_table and _RISK in kind.supports:
         band = risk_band_data(data, style, spec)
         if len(band):
             g = g + p9.geom_text(
@@ -526,25 +818,116 @@ def build_ggplot(data: pd.DataFrame, spec: PlotSpec, style: PlotStyle):
     if spec.facet_by and "_facet" in data.columns:
         order = [f for f in spec.facet_order if f in set(data["_facet"])] \
             or list(dict.fromkeys(data["_facet"]))
-        data["_facet"] = pd.Categorical(data["_facet"], categories=order, ordered=True)
+        data["_facet"] = pd.Categorical(data["_facet"], categories=order,
+                                        ordered=True)
         g = g + p9.facet_wrap("_facet", nrow=1)
 
-    y_limits = spec.y_limits or [y_lo, 1.02]
-    coord_args: dict[str, Any] = {"ylim": tuple(y_limits)}
-    if spec.x_limits:
-        coord_args["xlim"] = tuple(spec.x_limits)
     if needs_fill_scale:
         g = g + p9.scale_fill_manual(values=colours, guide=None)
-    g = (g
-         + p9.scale_color_manual(values=colours, name=spec.series_label or "Treatment")
-         + p9.scale_y_continuous(breaks=[0, 0.25, 0.5, 0.75, 1.0])
-         # Centred at-risk labels at t=0 and t=max need room, or they clip.
-         # Only an explicit x-limit overrides this expansion.
-         + p9.scale_x_continuous(expand=(0.07, 0))
-         + p9.coord_cartesian(**coord_args)
-         + p9.labs(title=spec.title or None, x=spec.x_label, y=spec.y_label)
+    g = g + p9.scale_color_manual(values=colours,
+                                  name=spec.series_label or "Treatment")
+
+    ## A probability gets fixed 0–1 breaks and, with an At-Risk Band, room
+    ## below zero for it. Everything else is free: a hazard rate and a count
+    ## of survivors have neither an upper bound nor a meaningful 0.25.
+    if kind.y == "km_lx":
+        g = g + p9.scale_y_continuous(breaks=[0, 0.25, 0.5, 0.75, 1.0])
+    coord_args: dict[str, Any] = {}
+    if spec.y_limits:
+        coord_args["ylim"] = tuple(spec.y_limits)
+    elif y_lo is not None:
+        coord_args["ylim"] = (y_lo, 1.02)
+    if spec.x_limits:
+        coord_args["xlim"] = tuple(spec.x_limits)
+    if coord_args:
+        g = g + p9.coord_cartesian(**coord_args)
+
+    return (g
+            # Centred at-risk labels at t=0 and t=max need room, or they clip.
+            + p9.scale_x_continuous(expand=(0.07, 0))
+            + p9.labs(title=spec.title or None, x=spec.x_label,
+                      y=spec.y_label or kind.y_label)
+            + _theme_for(style))
+
+
+def _build_forest(data: pd.DataFrame, spec: PlotSpec, style: PlotStyle,
+                  kind: PlotKind):
+    """Pairwise hazard ratios with their intervals, on a log ratio axis.
+
+    Log scale because a ratio is symmetric there: 0.5 and 2 sit the same
+    distance from the line of no effect, which is the whole point of reading
+    a forest plot by eye.
+    """
+    import plotnine as p9
+
+    labels = list(dict.fromkeys(data["label"]))
+    colours = style.colour_for(labels)
+    data = data.copy()
+    data["label"] = pd.Categorical(data["label"], categories=labels[::-1],
+                                   ordered=True)
+
+    g = (p9.ggplot(data, p9.aes(x="ratio", y="label", color="label"))
+         + p9.geom_vline(xintercept=1.0, linetype="dashed", color="#888888",
+                         size=0.4)
+         + p9.geom_errorbarh(p9.aes(xmin="ci_lo", xmax="ci_hi"),
+                             height=0.0, size=style.line_width,
+                             show_legend=False))
+    layer, _fill = _point_layer_xy(data, style, "label", x="ratio", y="label")
+    g = (g + layer
+         + p9.scale_color_manual(values=colours, guide=None)
+         + p9.scale_x_log10()
+         + p9.labs(title=spec.title or None,
+                   x=spec.x_label or "Hazard ratio (log scale)",
+                   y=spec.y_label or kind.y_label)
          + _theme_for(style))
     return g
+
+
+def _build_distribution(data: pd.DataFrame, spec: PlotSpec, style: PlotStyle,
+                        kind: PlotKind):
+    """The distribution of individual lifespans, one density per treatment."""
+    import plotnine as p9
+
+    series_col = _series_column(data)
+    labels = list(dict.fromkeys(data[series_col]))
+    colours = style.colour_for(labels)
+
+    g = (p9.ggplot(data, p9.aes(x="value", color=series_col, fill=series_col))
+         + p9.geom_density(alpha=style.ci_alpha, size=style.line_width))
+    if spec.facet_by and "_facet" in data.columns:
+        g = g + p9.facet_wrap("_facet", nrow=1)
+    return (g
+            + p9.scale_color_manual(values=colours,
+                                    name=spec.series_label or "Treatment")
+            + p9.scale_fill_manual(values=colours, guide=None)
+            + p9.labs(title=spec.title or None, x=spec.x_label,
+                      y=spec.y_label or kind.y_label)
+            + _theme_for(style))
+
+
+def _build_interaction(data: pd.DataFrame, spec: PlotSpec, style: PlotStyle,
+                       kind: PlotKind):
+    """Median lifespan by factor level, one line per level of the other.
+
+    Non-parallel lines are the interaction — which is why the lines are drawn
+    at all rather than leaving four disconnected points.
+    """
+    import plotnine as p9
+
+    labels = list(dict.fromkeys(data["label"]))
+    colours = style.colour_for(labels)
+
+    g = (p9.ggplot(data, p9.aes(x="x", y="value", color="label", group="label"))
+         + p9.geom_line(size=style.line_width)
+         + p9.geom_errorbar(p9.aes(ymin="ci_lo", ymax="ci_hi"), width=0.06,
+                            size=style.line_width * 0.8, show_legend=False))
+    layer, _fill = _point_layer_xy(data, style, "label", x="x", y="value")
+    return (g + layer
+            + p9.scale_color_manual(values=colours,
+                                    name=spec.series_label or "Treatment")
+            + p9.labs(title=spec.title or None, x=spec.x_label,
+                      y=spec.y_label or kind.y_label)
+            + _theme_for(style))
 
 
 _INSTALLED_FAMILIES: set[str] | None = None
@@ -570,7 +953,15 @@ def resolve_font_family(preferred: str) -> list[str]:
     return available or ["DejaVu Sans"]
 
 
-def _point_layer(points: pd.DataFrame, style: PlotStyle, series_col: str):
+def _point_layer_xy(points: pd.DataFrame, style: PlotStyle, series_col: str,
+                    x: str = "time", y: str = "value"):
+    """:func:`_point_layer` over an arbitrary pair of columns — the forest and
+    interaction plots put their markers on a category, not on a time."""
+    return _point_layer(points, style, series_col, x=x, y=y, always=True)
+
+
+def _point_layer(points: pd.DataFrame, style: PlotStyle, series_col: str,
+                 x: str = "time", y: str = "value", always: bool = False):
     """``(layer, maps_fill)`` for the markers drawn on the curve.
 
     Outline and interior are two aesthetics, not one: matplotlib draws a
@@ -583,11 +974,14 @@ def _point_layer(points: pd.DataFrame, style: PlotStyle, series_col: str):
 
     shape = style.point_shape if style.point_shape in POINT_SHAPES else "o"
     stroke = max(0.0, float(style.point_stroke))
-    mapping: dict[str, str] = {"x": "time", "y": "surv"}
+    mapping: dict[str, str] = {"x": x, "y": y}
     kwargs: dict[str, Any] = {
         "shape": shape,
-        "size": style.point_size,
-        "alpha": style.point_alpha,
+        ## On a forest or interaction plot the marker IS the estimate, so it
+        ## is never optional and never vanishingly small — the "draw points"
+        ## toggle governs decoration on a curve, not the data itself.
+        "size": max(style.point_size, 2.0) if always else style.point_size,
+        "alpha": 1.0 if always else style.point_alpha,
     }
     maps_fill = False
 
@@ -667,8 +1061,137 @@ def _theme_for(style: PlotStyle):
     if style.panel_bg:
         overrides["panel_background"] = p9.element_rect(fill=style.panel_bg)
 
-    return base(base_size=style.base_size,
-                base_family=families[0]) + p9.theme(**overrides)
+    ## theme_matplotlib is the one plotnine theme built from an rc dict
+    ## rather than (base_size, base_family) — passing those was a TypeError
+    ## the moment the theme was picked. The overrides above set every text
+    ## element's size and family explicitly, so nothing is lost by not
+    ## having base arguments to give it.
+    if base is p9.theme_matplotlib:
+        themed = base()
+    else:
+        themed = base(base_size=style.base_size, base_family=families[0])
+    return themed + p9.theme(**overrides)
+
+
+def forest_data(hazard_ratios: pd.DataFrame, spec: PlotSpec) -> pd.DataFrame:
+    """One row per pairwise comparison: the ratio and its interval."""
+    if hazard_ratios is None or not len(hazard_ratios):
+        return pd.DataFrame(columns=["label", "ratio", "ci_lo", "ci_hi"])
+    hr = hazard_ratios.copy()
+    out = pd.DataFrame({
+        "label": hr["group1"].astype(str) + " vs " + hr["group2"].astype(str),
+        "ratio": hr["hazard_ratio"].astype(float),
+        "ci_lo": hr["hr_ci_lo"].astype(float),
+        "ci_hi": hr["hr_ci_hi"].astype(float),
+    })
+    ## A ratio whose interval touches zero cannot be drawn on a log axis;
+    ## the matplotlib forest clips these the same way.
+    return out[(out["ratio"] > 0) & (out["ci_lo"] > 0)]
+
+
+def distribution_data(individual_data: pd.DataFrame,
+                      spec: PlotSpec) -> pd.DataFrame:
+    """One row per individual death: the lifespan and its treatment.
+
+    Censored individuals are excluded — their lifespan is unknown, not the
+    time they were last seen, and a density over last-seen times would be a
+    different (and misleading) figure.
+    """
+    df = individual_data
+    if df is None or not len(df):
+        return pd.DataFrame(columns=["value", "treatment", "label"])
+    df = df[df["event"] == 1] if "event" in df.columns else df
+    treatments = df["treatment"].astype(str)
+    wanted = [t for t in (spec.treatments or [])
+              if t in set(treatments)] or sorted(set(treatments))
+    df = df[treatments.isin(wanted)]
+    out = pd.DataFrame({
+        "value": df["time"].astype(float),
+        "treatment": df["treatment"].astype(str),
+    })
+    out["label"] = out["treatment"].map(
+        lambda t: spec.display_names.get(t, t))
+    if spec.facet_by:
+        parts = out["treatment"].str.split("/", n=1, expand=True)
+        if parts.shape[1] == 2:
+            out["_facet"], out["_series"] = parts[0], parts[1]
+            out["label"] = out["_series"]
+    return out
+
+
+def interaction_data(individual_data: pd.DataFrame,
+                     spec: PlotSpec) -> pd.DataFrame:
+    """Median lifespan (±SEM of the median via a normal approximation) per
+    factorial cell, shaped for the interaction plot: factor 1 on x, one line
+    per level of factor 2."""
+    df = individual_data
+    if df is None or not len(df) or "treatment" not in df.columns:
+        return pd.DataFrame(columns=["x", "value", "label"])
+    parts = df["treatment"].astype(str).str.split("/", n=1, expand=True)
+    if parts.shape[1] != 2:
+        ## Not factorial: nothing to cross.
+        return pd.DataFrame(columns=["x", "value", "label"])
+    work = pd.DataFrame({
+        "x": parts[0], "series": parts[1],
+        "time": df["time"].astype(float),
+        "event": (df["event"] if "event" in df.columns else 1),
+    })
+    work = work[work["event"] == 1]
+    rows = []
+    for (level, series), grp in work.groupby(["x", "series"], sort=True):
+        times = grp["time"].to_numpy(dtype=float)
+        if not len(times):
+            continue
+        median = float(np.median(times))
+        ## 1.2533·σ/√n — the standard error of a median under normality.
+        se = 1.2533 * float(np.std(times, ddof=1)) / max(len(times), 1) ** 0.5 \
+            if len(times) > 1 else 0.0
+        rows.append({"x": str(level), "value": median,
+                     "ci_lo": median - se, "ci_hi": median + se,
+                     "series": str(series)})
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return pd.DataFrame(columns=["x", "value", "label"])
+    out["label"] = out["series"].map(lambda s: spec.display_names.get(s, s))
+    return out
+
+
+def data_for(experiment, spec: PlotSpec,
+             lifetables: pd.DataFrame | None = None) -> pd.DataFrame:
+    """The prepared frame for one Spec, whatever its kind needs.
+
+    The three sources match the report's own builders (``plot_registry``):
+    lifetables for the series plots, the individual data for distributions
+    and interactions, the saved hazard ratios for the forest.
+    """
+    kind = kind_for(spec)
+    if kind.source == "lifetables":
+        lt = lifetables if lifetables is not None else _load_lifetables(experiment)
+        return series_data(lt, spec, kind)
+    if kind.source == "hazard_ratios":
+        return forest_data(_load_hazard_ratios(experiment), spec)
+    individual = _load_individual_data(experiment)
+    if kind.geom == "interaction":
+        return interaction_data(individual, spec)
+    return distribution_data(individual, spec)
+
+
+def _load_individual_data(experiment) -> pd.DataFrame:
+    """The saved individual-level frame; fall back to loading the input."""
+    path = experiment.analysis_dir / "data_output" / "individual_data.csv"
+    if path.is_file():
+        return pd.read_csv(path)
+    data, _ = experiment.load()
+    return data
+
+
+def _load_hazard_ratios(experiment) -> pd.DataFrame:
+    """The saved pairwise hazard ratios. Never recomputed here — a Cox fit is
+    analysis, and the Plot Editor must not silently run one."""
+    path = experiment.analysis_dir / "statistics" / "hazard_ratios.csv"
+    if path.is_file():
+        return pd.read_csv(path)
+    return pd.DataFrame()
 
 
 def figure_for(experiment, plot_id: str, spec: PlotSpec | None = None,
@@ -676,8 +1199,7 @@ def figure_for(experiment, plot_id: str, spec: PlotSpec | None = None,
     """Build the ggplot for one of an experiment's Publication Figures."""
     spec = spec or specs_for(experiment).get(plot_id) or default_spec(plot_id)
     style = style or resolve_style(spec.style, experiment)
-    lt = lifetables if lifetables is not None else _load_lifetables(experiment)
-    return build_ggplot(curve_data(lt, spec), spec, style)
+    return build_ggplot(data_for(experiment, spec, lifetables), spec, style)
 
 
 def _load_lifetables(experiment) -> pd.DataFrame:
@@ -727,20 +1249,33 @@ def render_all(experiment, fmt: str = "svg", log=None) -> list[Path]:
     """
     emit = log or (lambda _m: None)
     written: list[Path] = []
-    specs = specs_for(experiment)
+    ## Only the plots the container's plot_specs.yaml actually defines — the
+    ## sister app's rule. specs_for() fills defaults for the whole Plot Set
+    ## so the EDITOR can offer every figure; rendering those defaults headless
+    ## would produce a dozen figures nobody curated, and "render" would stop
+    ## meaning "render my figures".
+    specs = adopt_legacy_member_specs(experiment).plots
     if not specs:
-        emit(f"{experiment.name}: no publication figures defined.")
+        emit(f"{experiment.name}: nothing curated in plot_specs.yaml — "
+             f"no figures rendered. Curate them in the Plot Editor first.")
         return written
 
     lifetables = None
     for plot_id, spec in specs.items():
-        if plot_id not in _CURVE_PLOTS:
+        if plot_id not in PLOT_TYPES:
             continue
         try:
-            if lifetables is None:
+            if kind_for(spec).source == "lifetables" and lifetables is None:
                 lifetables = _load_lifetables(experiment)
             style = resolve_style(spec.style, experiment)
-            g = build_ggplot(curve_data(lifetables, spec), spec, style)
+            data = data_for(experiment, spec, lifetables)
+            if data.empty:
+                ## A forest with no saved Cox fit, an interaction with no
+                ## factorial cells: named and skipped, not an error — the
+                ## other figures still render.
+                emit(f"  {plot_id}: no data for this experiment — skipped.")
+                continue
+            g = build_ggplot(data, spec, style)
             target = experiment.figures_dir / f"{plot_id}.{fmt}"
             save_figure(g, target, style)
             written.append(target)

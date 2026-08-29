@@ -87,12 +87,14 @@ def _exec_run_in_experiments(params: dict, ctx: ProjectRunContext) -> None:
 
 
 def _exec_render_publication_figures(params: dict, ctx: ProjectRunContext) -> None:
-    """Render every member's curated Publication Figures.
+    """Render the Project's curated Publication Figures for every member.
 
-    A member with no saved ``plots:`` is skipped rather than rendered from
-    the Experiment Type's default Specs: this action runs unattended inside a
-    Batch Run, and nobody asked for default-spec figures (ADR-0005 — Specs are
-    authored down, in the member's own ``plot_specs.yaml``).
+    The curation lives in the **Project's** ``plot_specs.yaml`` — one set of
+    Specs and Styles every member renders with. A Project that has curated
+    nothing renders nothing: this runs unattended inside a Batch Run, and
+    nobody asked for default-spec figures. (A Spec a member still carries
+    from the old per-member layout is honoured via the same adoption rule
+    the Plot Editor uses.)
     """
     from .. import pubfigures
 
@@ -101,16 +103,17 @@ def _exec_render_publication_figures(params: dict, ctx: ProjectRunContext) -> No
     rendered = 0
     members = ctx.project.members()
     for member in members:
-        if not pubfigures.load_specs(member.directory):
-            ctx.log(f"  [{member.name}] no curated figure specs — skipped.")
+        if not pubfigures.adopt_legacy_member_specs(member).plots:
+            ctx.log(f"  [{member.name}] nothing curated — skipped.")
             continue
         ctx.log(f"  [{member.name}] publication figures…")
         rendered += 1
         total += len(pubfigures.render_all(
             member, fmt=fmt, log=lambda m, p=member.name: ctx.log(f"  [{p}] {m}")))
     if not rendered:
-        ctx.log("render_publication_figures: no member has curated specs — "
-                "nothing rendered. Curate figures in the Plot Editor first.")
+        ctx.log("render_publication_figures: this Project has no curated "
+                "figure specs — nothing rendered. Curate figures in the "
+                "Plot Editor first.")
         return
     ctx.log(f"{total} publication figure(s) across {rendered}/{len(members)} member(s).")
 
@@ -283,10 +286,14 @@ def report_pipeline_for(project) -> tuple[list[dict], str | None]:
     from .. import pubfigures
 
     steps = list(BUILTIN_SCRIPTS["Report pipeline"])
-    if any(pubfigures.load_specs(m.directory) for m in project.members()):
+    ## The curation is the Project's now; a leftover per-member spec still
+    ## counts, through the same adoption rule the renderer applies.
+    if pubfigures.load_specs(project.directory) or any(
+            pubfigures.adopt_legacy_member_specs(m).plots
+            for m in project.members()):
         return [dict(s) for s in steps], None
     kept = [dict(s) for s in steps if s.get("action") != "render_publication_figures"]
-    return kept, "no member has curated figure specs — figure step skipped"
+    return kept, "no curated figure specs in this project — figure step skipped"
 
 
 def builtin_steps(name: str) -> list[dict] | None:

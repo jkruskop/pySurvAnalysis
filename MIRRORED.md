@@ -31,7 +31,7 @@ mechanical rather than archaeological.
 | `pysurvanalysis/script_editor/{canvas,inspector,palette,window}.py` | same | vendored earlier; `window.py` is now level-aware, `palette.py` rebuildable |
 | `pysurvanalysis/apps/hub.py` | `pytrackinganalysis/apps/hub.py` | **structure ported, body rewritten** — same tile strip and panel model, survival domain, type-contributed Analyze cards; now also the cached recursive scan, batch table with keys/status/red rows/context menu, card dimming, always-lit Batch and Project tiles, tab suppression, stream logging, and the Create/Load ∥ Experiments card pair with a button per state (ADR-0010) |
 | `pysurvanalysis/apps/plot_editor.py` | `pytrackinganalysis/apps/plot_editor.py` | **structure ported** — same Spec/Style editing model, experiment-level (ADR-0005); `ColorButton` (alpha-aware, "none" = transparent) and the wheel-transparent `_NoWheelSpin`/`_NoWheelCombo`/`_NoWheelFontCombo` are **near-verbatim**. The style form is grouped into four Cards rather than one QGroupBox column, and the preview renders at widget resolution × device pixel ratio (upstream's is fixed-DPI) |
-| `pysurvanalysis/pubfigures.py` | `pytrackinganalysis/pubfigures.py` | **reimplemented** on the same Spec/Style contract for survivorship curves + the At-Risk Band (ADR-0004). `resolve_font_family` is **verbatim**; the per-element font sizes, `text_color`, `line_pt`, `strip_style`/`strip_bg`/`panel_bg` and the outlined-point treatment (`fill` = series, `color` = edge, `stroke` = weight) follow upstream's `PlotStyle`/`_theme_for` field for field. `step_expand` and `point_data` are local — a step curve has knots where a jittered dot plot has none |
+| `pysurvanalysis/pubfigures.py` | `pytrackinganalysis/pubfigures.py` | **reimplemented** on the same Spec/Style contract for survivorship curves + the At-Risk Band (ADR-0004). `resolve_font_family` is **verbatim**; the per-element font sizes, `text_color`, `line_pt`, `strip_style`/`strip_bg`/`panel_bg` and the outlined-point treatment (`fill` = series, `color` = edge, `stroke` = weight) follow upstream's `PlotStyle`/`_theme_for` field for field. `step_expand` and `point_data` are local — a step curve has knots where a jittered dot plot has none. Now also `ProjectSpecs`/`load_project_specs`/`save_project_specs` — upstream's single project-root `plot_specs.yaml`, adopted here (ADR-0005 amendment) with `specs_root` falling back to a standalone experiment's own directory, plus a `PlotKind` table dispatching the whole Plot Set (series / forest / distribution / interaction) where upstream has one figure shape. `render_all` follows upstream's curated-only rule, but stricter: an empty `plots:` renders nothing here, where upstream falls back to every plot type |
 | `pysurvanalysis/script_editor/project_actions.py` | `pytrackinganalysis/script_editor/project_actions.py` | **reimplemented**; no pooling actions, adds the type-registry hard error |
 | `pysurvanalysis/domain/batch.py` | `pytrackinganalysis/batch.py` | **reimplemented** on the same contract — structural Batch, lazy `batch.yaml`, `resolve_designated_script` central→own→built-in, no implicit fallback (ADR-0007); now also the recursive walk, `project_kind`, relative-path keys, scoped `run()` (ADR-0009 ← upstream ADR-0011) |
 | `pysurvanalysis/domain/layout.py` | `pytrackinganalysis/layout.py` | **structure ported, body rewritten** — same `classify`/`members_in` contract and the same "decide with the loader's own rule" principle, but this loader accepts data at the root *or* `data/`, so there is no Unfiled Recording and none of the filing machinery. Its blocked set is no-config / no-data / ambiguous; `initializable_dirs` came across for the Initialize picker, with an added `<stem>_figures` suffix rule this app's report backend needs |
@@ -83,11 +83,12 @@ framing, which ADR-0001 forbids.
   and `censor_color`, `ci_alpha`, `grid`, and the At-Risk Band's own size and
   times. `point_size`/`point_alpha`/`point_stroke`/`point_fill` and the
   outlined-point mechanics are shared with upstream exactly.
-* **Plot Editor is experiment-level, Styles resolve upward** (ADR-0005), and
-  **rendering is project-level**: a Spec belongs to one experiment but a
-  render walks every member, so the two live on different cards — authoring
-  in the Plot Editor, rendering on the Project panel. The Plots tile carries
-  only the Type Actions the loaded Experiment Type contributes.
+* **The Plot Editor opens on a member; the curation is the Project's**
+  (ADR-0005 as amended, matching upstream's project-root `plot_specs.yaml`).
+  A member supplies the preview's data; Specs and Styles save to the
+  container. Rendering is project-level — its button lives on the Project
+  panel and nowhere else, and the Plots tile carries only the Type Actions
+  the loaded Experiment Type contributes.
 * **No Unfiled Recording, and no filing.** Upstream's loader reads `data/`
   alone, so a recording loose at the experiment root is a repairable blocked
   state and its preflight moves the file. `SurvivalExperiment.data_file`

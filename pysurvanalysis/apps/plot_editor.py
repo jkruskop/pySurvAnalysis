@@ -44,7 +44,7 @@ from PyQt6.QtWidgets import (
 
 from .. import pubfigures as pf
 from ..domain import Project, SurvivalExperiment, is_project_dir
-from ..ui import ActionButton, Card, Category, OutputLog, TopBar, apply_theme, icon
+from ..ui import ActionButton, Card, Category, TopBar, apply_theme, icon
 from ..ui import settings as ui_settings
 
 
@@ -198,20 +198,30 @@ class PlotEditorWindow(QMainWindow):
         self.setWindowTitle(f"Plot Editor — {experiment.name}")
         self.resize(1200, 820)
 
-        self._specs = pf.specs_for(experiment)
-        self._styles, self._default_style = pf.load_styles(
-            experiment.project.directory if experiment.project else None)
+        ## Everything edited here lives in ONE plot_specs.yaml at the
+        ## container (the Project, or the standalone experiment itself) —
+        ## the sister app's model. The experiment in hand supplies the data
+        ## the preview draws and the Plot Set on offer; the curation is the
+        ## Project's.
+        self._specs_root = pf.specs_root(experiment)
+        self._project_specs = pf.adopt_legacy_member_specs(experiment)
+        self._specs = pf.fill_default_specs(self._project_specs.plots,
+                                            experiment)
+        self._styles = self._project_specs.styles
+        self._default_style = self._project_specs.default_style
         self._lifetables = None
         self._current_id = (experiment.type.headline_plot_id
                             if experiment.type.headline_plot_id in self._specs
                             else next(iter(self._specs), None))
 
+        self._status = self.statusBar()
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
         self._resize_timer.timeout.connect(self._refresh_preview)
 
         self._build_ui()
         self._load_spec_into_form()
+        self._sync_supported_controls()
         self._refresh_preview()
 
     # ── construction ───────────────────────────────────────────────────────
@@ -224,9 +234,17 @@ class PlotEditorWindow(QMainWindow):
         outer.setSpacing(8)
 
         bar = TopBar(f"Plot Editor — {self.experiment.name}")
-        save_spec = QPushButton(icon("save"), " Save spec")
+        save_spec = QPushButton(icon("save"), " Save this figure to project")
+        save_spec.setToolTip(
+            "Write THIS figure's spec, and the style it uses, into the "
+            "container's plot_specs.yaml. Only saved figures are rendered by "
+            "'Render publication figures' — the rest of the Plot Set stays "
+            "editable here without being curated.")
         save_spec.clicked.connect(self._save_spec)
-        save_style = QPushButton(icon("save_as"), " Save style to project")
+        save_style = QPushButton(icon("save_as"), " Save styles to project")
+        save_style.setToolTip(
+            "Write the whole Style library and the default-style name — "
+            "without touching which figures are curated.")
         save_style.clicked.connect(self._save_style)
         export = QPushButton(icon("figures"), " Export…")
         export.clicked.connect(self._export)
@@ -253,17 +271,15 @@ class PlotEditorWindow(QMainWindow):
         side_scroll.setMinimumWidth(380)
         splitter.addWidget(side_scroll)
 
-        right = QWidget()
-        right_lay = QVBoxLayout(right)
-        right_lay.setContentsMargins(0, 0, 0, 0)
+        ## The preview is the whole right-hand side. There was an output log
+        ## under it, but nothing here streams: the four things it ever printed
+        ## were a failure the preview itself already shows in full, and three
+        ## one-line save confirmations, which belong on the status bar. A
+        ## 150px terminal for those was space taken from the figure.
         self._preview = QLabel("No preview yet.")
         self._preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._preview.setMinimumSize(600, 420)
-        right_lay.addWidget(self._preview, 1)
-        self._log = OutputLog()
-        self._log.setMaximumHeight(150)
-        right_lay.addWidget(self._log)
-        splitter.addWidget(right)
+        splitter.addWidget(self._preview)
         splitter.setSizes([400, 800])
         outer.addWidget(splitter, 1)
 
@@ -293,13 +309,19 @@ class PlotEditorWindow(QMainWindow):
             widget.editingFinished.connect(self._refresh_preview)
             form.addRow(label, widget)
 
-        self._reference_line = QDoubleSpinBox()
-        self._reference_line.setRange(-1.0, 1.0)
-        self._reference_line.setSingleStep(0.05)
-        self._reference_line.setSpecialValueText("none")
-        self._reference_line.setValue(-1.0)
+        ## A checkbox, not a magic value: "none" used to be spelled -1.0,
+        ## which both hid a legal value (a log-log reference is negative) and
+        ## made "no line" a thing you scroll to rather than a thing you say.
+        self._ref_check = QCheckBox()
+        self._ref_check.setToolTip("Draw a dashed horizontal reference line.")
+        self._reference_line = _spin(-1e6, 1e6, 0.05, 3)
+        self._reference_line.setEnabled(False)
+        self._reference_line.setValue(0.5)
+        self._ref_check.toggled.connect(self._reference_line.setEnabled)
+        self._ref_check.toggled.connect(self._refresh_preview)
         self._reference_line.valueChanged.connect(self._refresh_preview)
-        form.addRow("Reference line:", self._reference_line)
+        form.addRow("Reference line:", _row(self._ref_check,
+                                            self._reference_line))
 
         self._style_combo = QComboBox()
         self._style_combo.addItems(list(self._styles))
@@ -510,10 +532,10 @@ class PlotEditorWindow(QMainWindow):
     def _series_labels(self) -> list[str]:
         """The curve labels the current figure will draw, in plot order."""
         spec = self.spec
-        if spec is None or self._lifetables is None:
+        if spec is None:
             return []
         try:
-            data = pf.curve_data(self._lifetables, spec)
+            data = pf.data_for(self.experiment, spec, self._lifetables)
         except Exception:  # noqa: BLE001 - the preview reports it; not here
             return []
         if data.empty:
@@ -586,10 +608,14 @@ class PlotEditorWindow(QMainWindow):
             widget.blockSignals(True)
             widget.setText(value)
             widget.blockSignals(False)
-        self._reference_line.blockSignals(True)
-        self._reference_line.setValue(
-            spec.reference_line if spec.reference_line is not None else -1.0)
-        self._reference_line.blockSignals(False)
+        for widget in (self._ref_check, self._reference_line):
+            widget.blockSignals(True)
+        self._ref_check.setChecked(spec.reference_line is not None)
+        if spec.reference_line is not None:
+            self._reference_line.setValue(float(spec.reference_line))
+        self._reference_line.setEnabled(spec.reference_line is not None)
+        for widget in (self._ref_check, self._reference_line):
+            widget.blockSignals(False)
         self._style_combo.blockSignals(True)
         self._style_combo.setCurrentText(
             spec.style if spec.style in self._styles else self._default_style)
@@ -683,8 +709,8 @@ class PlotEditorWindow(QMainWindow):
             spec.y_label = self._y_label.text()
             spec.series_label = self._series_label.text()
             spec.facet_by = self._facet_by.text()
-            ref = self._reference_line.value()
-            spec.reference_line = None if ref <= -0.999 else ref
+            spec.reference_line = (self._reference_line.value()
+                                   if self._ref_check.isChecked() else None)
             spec.style = self._style_combo.currentText()
         for attr, field_name in self._NUMBERS:
             setattr(style, field_name, getattr(self, attr).value())
@@ -716,7 +742,34 @@ class PlotEditorWindow(QMainWindow):
     def _on_plot_changed(self, plot_id: str) -> None:
         self._current_id = plot_id
         self._load_spec_into_form()
+        self._sync_supported_controls()
         self._refresh_preview()
+
+    def _sync_supported_controls(self) -> None:
+        """Disable the Style controls the current plot ignores.
+
+        A censor tick on a hazard curve or an at-risk band under a forest
+        plot is not a setting anyone wants greyed-in-but-ignored: the honest
+        control is one that says "not for this figure" by being disabled.
+        The values are left alone — they still belong to the shared Style,
+        and another figure uses them.
+        """
+        kind = pf.kind_for(self.spec or self._current_id or "km_curves")
+        groups = {
+            "ci": (self._ci_band, self._ci_alpha),
+            "censor": (self._censor_ticks, self._censor_shape,
+                       self._censor_size, self._censor_color),
+            "risk": (self._risk_table, self._risk_font_size,
+                     self._risk_row_height, self._risk_times),
+            "points": (self._show_points, self._point_at, self._point_shape,
+                       self._point_size, self._point_alpha, self._point_fill,
+                       self._point_stroke, self._point_stroke_color),
+        }
+        for feature, widgets in groups.items():
+            enabled = feature in kind.supports
+            for widget in widgets:
+                widget.setEnabled(enabled)
+        self._facet_by.setEnabled(kind.faceted)
 
     def _on_style_changed(self, _name: str) -> None:
         self._load_style_into_form()
@@ -753,7 +806,8 @@ class PlotEditorWindow(QMainWindow):
             self._preview.setText("This experiment has no publication figures.")
             return
         try:
-            if self._lifetables is None:
+            if self._lifetables is None \
+                    and pf.kind_for(spec).source == "lifetables":
                 self._lifetables = pf._load_lifetables(self.experiment)
             ## The curves are a property of the DATA and the Spec, so they are
             ## not known until the lifetables are read — which happens here,
@@ -762,11 +816,19 @@ class PlotEditorWindow(QMainWindow):
             if set(self._series_swatches) != set(self._series_labels()):
                 self._rebuild_colour_controls()
                 spec, style = self._harvest()
-            g = pf.build_ggplot(pf.curve_data(self._lifetables, spec), spec, style)
+            frame = pf.data_for(self.experiment, spec, self._lifetables)
+            if frame.empty:
+                self._preview.setText(
+                    f"No data for {spec.plot_id} in this experiment.\n"
+                    "A forest needs a saved Cox fit; an interaction plot "
+                    "needs a factorial design.")
+                return
+            g = pf.build_ggplot(frame, spec, style)
             data = pf.render_png_bytes(g, style, dpi=self._preview_dpi(style))
         except Exception as exc:  # noqa: BLE001 - a bad spec shows, never crashes
+            ## Said once, in the place you are already looking. The log used
+            ## to repeat it underneath.
             self._preview.setText(f"Preview failed:\n{exc}")
-            self._log.append_line(f"Preview failed: {exc}")
             return
         ratio = self._preview.devicePixelRatioF()
         pixmap = QPixmap()
@@ -797,32 +859,45 @@ class PlotEditorWindow(QMainWindow):
         super().resizeEvent(event)
         self._resize_timer.start(150)
 
+    def _say(self, message: str) -> None:
+        """A confirmation on the status bar.
+
+        Long enough to read a path off, short enough that it does not sit
+        there implying the last save is still the current state.
+        """
+        self._status.showMessage(message, 12_000)
+
     # ── saving ─────────────────────────────────────────────────────────────
 
     def _save_spec(self) -> None:
-        self._harvest()
-        path = pf.save_specs(self.experiment.directory, self._specs)
-        self._log.append_line(f"Saved specs to {path}")
+        """Write THIS figure's spec — and the style it references — to the
+        container's plot_specs.yaml.
+
+        One figure per save, never the whole working set: the working specs
+        include a filled default for every plot in the Plot Set (so the combo
+        can offer them all), and writing those out would put a dozen figures
+        nobody curated into the yaml — after which a render produces every
+        possible plot instead of the curated ones. What lands in the file is
+        exactly what the user has said "save" over, which is the sister
+        app's rule.
+        """
+        spec, style = self._harvest()
+        if spec is None:
+            return
+        self._project_specs.plots[spec.plot_id] = spec
+        ## The spec is not complete without the look it names: a spec saved
+        ## against an unsaved style would render with the stale copy on disk.
+        self._project_specs.styles[style.name] = style
+        path = pf.save_project_specs(self._specs_root, self._project_specs)
+        self._say(f"Saved {spec.plot_id} (spec + style {style.name!r}) to "
+                  f"{path}.")
 
     def _save_style(self) -> None:
         self._harvest()
-        project = self.experiment.project
-        if project is None:
-            if is_project_dir(self.experiment.directory.parent):
-                project = Project(self.experiment.directory.parent)
-            else:
-                QMessageBox.information(
-                    self, "Plot Editor",
-                    "Styles are shared by a Project, and this is a standalone "
-                    "experiment. Saving the style to the experiment's own "
-                    "plot_specs.yaml instead.")
-                pf.save_styles(self.experiment.directory, self._styles,
-                               self._style_combo.currentText())
-                return
-        path = pf.save_styles(project.directory, self._styles,
-                              self._style_combo.currentText())
-        self._log.append_line(f"Saved styles to {path} — every member's figures "
-                              f"use them.")
+        self._project_specs.styles = dict(self._styles)
+        self._project_specs.default_style = self._style_combo.currentText()
+        path = pf.save_project_specs(self._specs_root, self._project_specs)
+        self._say(f"Saved styles to {path} — every member's figures use them.")
 
     def _export(self) -> None:
         spec, style = self._harvest()
@@ -835,12 +910,14 @@ class PlotEditorWindow(QMainWindow):
         if not path:
             return
         try:
-            g = pf.build_ggplot(pf.curve_data(self._lifetables, spec), spec, style)
+            g = pf.build_ggplot(
+                pf.data_for(self.experiment, spec, self._lifetables),
+                spec, style)
             written = pf.save_figure(g, path, style)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "Plot Editor", f"Export failed: {exc}")
             return
-        self._log.append_line(f"Exported {written}")
+        self._say(f"Exported {written}")
 
 
 def main() -> None:

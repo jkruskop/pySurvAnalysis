@@ -99,8 +99,10 @@ def test_plot_actions_land_on_the_plots_card_not_analyze(hub):
     analyze = _button_labels(hub._analyze_card)
     plots = _button_labels(hub._plot_actions_card)
 
-    ## Core, and PLOTS: it renders figures, so it belongs beside them.
-    assert "Render publication figures" in plots
+    ## Project-level only: rendering walks every member, so its button lives
+    ## on the Project panel and NOWHERE on the experiment tiles. The script
+    ## action still exists for Experiment Scripts.
+    assert "Render publication figures" not in plots
     assert "Render publication figures" not in analyze
 
     ## Core, and ANALYZE: it stays put.
@@ -113,7 +115,8 @@ def test_plot_actions_land_on_the_plots_card_not_analyze(hub):
 
     registry = action_mod.registry_for(hub._experiment.type)
     plot_titles = {a.title for a in registry.values()
-                   if a.category is Category.PLOTS}
+                   if a.category is Category.PLOTS
+                   and a.key != "render_publication_figures"}
     assert plot_titles, "expected this type to contribute at least one plot"
     assert plot_titles.isdisjoint(analyze)
     assert plot_titles <= set(plots)
@@ -260,7 +263,10 @@ def test_plot_editor_opens_on_the_headline_figure(qapp, analysed_project):
         editor.close()
 
 
-def test_plot_editor_saves_specs_down_and_styles_up(qapp, analysed_project):
+def test_plot_editor_saves_both_halves_to_the_project(qapp, analysed_project):
+    """Specs AND Styles land in the container's one plot_specs.yaml — the
+    sister app's model: what is saved here is the project default every
+    member renders with."""
     from pysurvanalysis import pubfigures as pf
     from pysurvanalysis.apps.plot_editor import PlotEditorWindow
     from pysurvanalysis.domain import config as cfgmod
@@ -276,10 +282,16 @@ def test_plot_editor_saves_specs_down_and_styles_up(qapp, analysed_project):
     finally:
         editor.close()
 
-    assert pf.load_specs(member.directory)["km_faceted"].title == "A curated title"
-    styles = cfgmod.read_yaml(project.specs_path)["styles"]
-    assert styles["default"]["width_mm"] == 160.0
-    assert "plots" not in cfgmod.read_yaml(project.specs_path)
+    payload = cfgmod.read_yaml(project.specs_path)
+    assert payload["plots"]["km_faceted"]["title"] == "A curated title"
+    assert payload["styles"]["default"]["width_mm"] == 160.0
+    ## And nothing was written into the member.
+    assert not (member.directory / cfgmod.SPECS_FILENAME).exists() \
+        or "plots" not in cfgmod.read_yaml(
+            member.directory / cfgmod.SPECS_FILENAME)
+    ## The other member sees the same curation.
+    assert pf.specs_for(project.member("rep_b"))["km_faceted"].title \
+        == "A curated title"
 
 
 def test_script_editor_switches_level_and_registry(qapp, analysed_project):
@@ -429,20 +441,41 @@ def test_loading_a_member_lands_on_the_analyze_panel(hub):
     assert hub._open_panel == "analyze"
 
 
-def test_suppressing_tabs_closes_the_figure_instead_of_showing_it(hub):
+def test_suppressing_tabs_closes_the_figure_only_during_a_batch_run(hub):
+    """The switch is batch-scoped: a plot button clicked on one experiment is
+    a request to SEE that figure, and suppressing it made the button do
+    nothing visible."""
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     hub._chk_suppress_tabs.setChecked(True)
+
+    ## Not a batch task: the figure is shown, box or no box.
+    hub._worker_is_batch = False
+    figure = plt.figure()
+    before = hub._plots.count()
+    hub._on_figure("a curve", figure)
+    assert hub._plots.count() == before + 1
+
+    ## A batch task: suppressed, and closed rather than merely skipped —
+    ## with no tab to own it pyplot would hold the figure for the life of
+    ## the process.
+    hub._worker_is_batch = True
     figure = plt.figure()
     before = hub._plots.count()
     hub._on_figure("a curve", figure)
     assert hub._plots.count() == before
-    ## Closed, not merely skipped: with no tab to own it pyplot would hold the
-    ## figure for the life of the process.
     assert not plt.fignum_exists(figure.number)
+
+    ## Batch task, box off: shown.
+    hub._chk_suppress_tabs.setChecked(False)
+    figure = plt.figure()
+    before = hub._plots.count()
+    hub._on_figure("a curve", figure)
+    assert hub._plots.count() == before + 1
+    hub._worker_is_batch = False
 
 
 def test_unsuppressed_figures_still_become_tabs(hub):
@@ -1011,3 +1044,74 @@ def test_the_at_risk_times_field_ignores_a_half_typed_list(editor):
     editor._risk_times.setText("0, 20, , 40x, 60")
     _spec, style = editor._harvest()
     assert style.risk_table_times == [0.0, 20.0, 60.0]
+
+
+def test_the_plot_editor_has_no_output_log(editor):
+    """Nothing in this window streams.
+
+    The log printed four things: a failure the preview already states in full,
+    and three one-line save confirmations. A 150px terminal for those was
+    space taken from the figure, so the confirmations moved to the status bar.
+    """
+    from pysurvanalysis.ui import OutputLog
+
+    assert not editor.findChildren(OutputLog)
+    assert not hasattr(editor, "_log")
+
+
+def test_saving_confirms_on_the_status_bar(editor):
+    editor._save_spec()
+    message = editor._status.currentMessage()
+    assert "Saved" in message and "plot_specs.yaml" in message
+
+
+def test_save_writes_only_the_current_figure(editor):
+    """The working set fills defaults for the whole Plot Set so every figure
+    is editable — but only what the user saves over lands in the yaml, or a
+    render would produce every possible plot instead of the curated ones."""
+    from pysurvanalysis import pubfigures as pf
+    from pysurvanalysis.domain import config as cfgmod
+
+    editor._title_edit.setText("Only me")
+    editor._save_spec()
+    payload = cfgmod.read_yaml(editor._specs_root / cfgmod.SPECS_FILENAME)
+    current = editor._current_id
+    assert list(payload["plots"]) == [current]
+    assert payload["plots"][current]["title"] == "Only me"
+    ## And the style it references was saved with it: a spec against an
+    ## unsaved style would render with the stale copy on disk.
+    assert payload["plots"][current]["style"] in payload["styles"]
+
+
+def test_a_failed_preview_still_says_so_in_the_preview(editor, monkeypatch):
+    """It was said twice — in the label and in the log. Removing the log must
+    not have removed the message."""
+    from pysurvanalysis import pubfigures as pf
+
+    def _boom(*_a, **_k):
+        raise ValueError("boom")
+
+    monkeypatch.setattr(pf, "build_ggplot", _boom)
+    editor._refresh_preview()
+    assert editor._preview.text() == "Preview failed:\nboom"
+
+
+def test_the_reference_line_is_governed_by_its_checkbox(editor):
+    """Unchecked = no line. "none" used to be spelled -1.0, which both hid a
+    legal value (a log-log reference is negative) and made "no line" a thing
+    you scroll to rather than a thing you say."""
+    assert editor._ref_check.isChecked()          # KM seeds the 0.5 median line
+
+    editor._ref_check.setChecked(False)
+    spec, _style = editor._harvest()
+    assert spec.reference_line is None
+    assert not editor._reference_line.isEnabled()
+
+    editor._ref_check.setChecked(True)
+    editor._reference_line.setValue(-0.25)        # legal now: log-log space
+    spec, _style = editor._harvest()
+    assert spec.reference_line == -0.25
+
+    editor._load_spec_into_form()                 # and it round-trips
+    assert editor._ref_check.isChecked()
+    assert editor._reference_line.value() == -0.25

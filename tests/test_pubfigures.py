@@ -16,34 +16,60 @@ def lifetables(project):
     return lifetable.compute_lifetables(data)
 
 
-def test_styles_resolve_member_then_project_then_builtin(project):
+def test_styles_resolve_at_the_container(project):
+    """One lookup: the container's library, then the built-in — the sister
+    app's model, with no member-level library to fall back from."""
     member = project.member("rep_a")
     assert pf.resolve_style("default", member).width_mm == pf.BUILTIN_STYLE.width_mm
 
     pf.save_styles(project.directory,
                    {"default": pf.PlotStyle(name="default", width_mm=180)},
                    "default")
-    project_style = pf.resolve_style("default", project.member("rep_a"))
-    assert project_style.width_mm == 180
-
-    pf.save_styles(member.directory,
-                   {"local": pf.PlotStyle(name="local", width_mm=60)}, "local")
-    assert pf.resolve_style("local", member).width_mm == 60
-    # The project's shared look still wins for the shared name.
     assert pf.resolve_style("default", member).width_mm == 180
+    ## An unknown name falls back to the container's default, never a crash.
+    assert pf.resolve_style("nonexistent", member).width_mm == 180
 
 
-def test_specs_live_with_the_experiment(project):
+def test_specs_live_at_the_container(project):
+    """Specs and Styles share one plot_specs.yaml at the Project: a Spec is a
+    shared editorial decision, and per-member spec files meant curating one
+    figure per member by hand."""
     member = project.member("rep_a")
+    root = pf.specs_root(member)
+    assert root == project.directory
+
     specs = pf.specs_for(member)
     specs["km_faceted"].title = "Headline"
-    path = pf.save_specs(member.directory, specs)
-    assert path.parent == member.directory
+    path = pf.save_specs(root, specs)
+    assert path.parent == project.directory
 
-    reloaded = pf.load_specs(member.directory)
-    assert reloaded["km_faceted"].title == "Headline"
-    # Nothing was written to the Project.
-    assert "plots" not in cfgmod.read_yaml(project.specs_path)
+    ## Every member reads the same curation back.
+    assert pf.specs_for(project.member("rep_b"))["km_faceted"].title == "Headline"
+
+
+def test_a_standalone_experiment_is_its_own_container(standalone):
+    assert pf.specs_root(standalone) == standalone.directory
+
+
+def test_legacy_member_specs_are_adopted_not_ignored(project):
+    """Specs curated under the old per-member layout are lifted into the
+    container — but a Spec the container already has wins, since a choice
+    made for the whole Project outranks one inherited from whichever member
+    happens to be opened first."""
+    member = project.member("rep_a")
+    legacy = pf.default_spec("km_faceted")
+    legacy.title = "Curated on the member"
+    cfgmod.write_yaml(member.directory / cfgmod.SPECS_FILENAME,
+                      {"plots": {"km_faceted": legacy.to_dict()}})
+
+    specs = pf.adopt_legacy_member_specs(member)
+    assert specs.plots["km_faceted"].title == "Curated on the member"
+
+    shared = pf.default_spec("km_faceted")
+    shared.title = "Chosen for the Project"
+    pf.save_specs(project.directory, {"km_faceted": shared})
+    specs = pf.adopt_legacy_member_specs(member)
+    assert specs.plots["km_faceted"].title == "Chosen for the Project"
 
 
 def test_faceted_spec_is_seeded_from_the_declared_factors(project):
@@ -58,7 +84,7 @@ def test_curve_data_anchors_every_curve_at_one(lifetables):
     for _label, group in data.groupby("treatment", observed=True):
         first = group.sort_values("time").iloc[0]
         assert first["time"] == 0.0
-        assert first["surv"] == 1.0
+        assert first["value"] == 1.0
 
 
 def test_at_risk_band_counts_match_the_lifetable(lifetables):
@@ -90,11 +116,23 @@ def test_build_ggplot_produces_a_plot(lifetables):
     assert g is not None
 
 
-def test_render_all_writes_vector_files_with_live_text(project, tmp_path):
+def test_render_all_writes_only_the_curated_figures(project, tmp_path):
+    """Rendering means "render my figures": only plots defined in the
+    container's plot_specs.yaml are produced, never the whole Plot Set with
+    defaults — the sister app's rule."""
     member = project.member("rep_a")
     member.run_analysis()
+
+    ## Nothing curated: nothing rendered, and the log says why.
+    logs: list[str] = []
+    assert pf.render_all(member, fmt="svg", log=logs.append) == []
+    assert any("nothing curated" in line for line in logs)
+
+    spec = pf.default_spec("km_faceted")
+    spec.facet_by = "Genotype"
+    pf.save_specs(project.directory, {"km_faceted": spec})
     written = pf.render_all(member, fmt="svg")
-    assert written
+    assert [path.name for path in written] == ["km_faceted.svg"]
     for path in written:
         assert path.parent == member.figures_dir
         text = path.read_text(encoding="utf-8")
@@ -104,8 +142,8 @@ def test_render_all_writes_vector_files_with_live_text(project, tmp_path):
 
 def test_empty_data_is_a_clear_error():
     spec = pf.default_spec("km_curves")
-    with pytest.raises(ValueError, match="No curve data"):
-        pf.build_ggplot(pd.DataFrame(columns=["time", "surv"]), spec, pf.PlotStyle())
+    with pytest.raises(ValueError, match="No data"):
+        pf.build_ggplot(pd.DataFrame(columns=["time", "value"]), spec, pf.PlotStyle())
 
 
 # ── the confidence band ────────────────────────────────────────────────────
@@ -157,20 +195,22 @@ def test_every_plot_in_the_set_renders_with_the_band_on(project, type_key):
     from pysurvanalysis.experiment_types import get_type
 
     member = project.member("rep_a")
+    member.run_analysis()
     data, _factors = member.load()
     tables = lifetable.compute_lifetables(data)
 
     for plot_id in get_type(type_key).plot_ids():
+        plot_id = pf._SPEC_ALIASES.get(plot_id, plot_id)
         spec = pf.default_spec(plot_id)
-        if plot_id == "km_faceted":
+        if pf.PLOT_KINDS[plot_id].faceted:
             spec.facet_by = "Genotype"
-        curves = pf.curve_data(tables, spec)
-        if curves.empty:
+        frame = pf.data_for(member, spec, tables)
+        if frame.empty:
             continue
         for band in (False, True):
             style = pf.PlotStyle()
             style.ci_band = band
-            g = pf.build_ggplot(curves, spec, style)
+            g = pf.build_ggplot(frame, spec, style)
             ## Built AND drawn: the parameter errors this guards against only
             ## surface when plotnine assembles the layers.
             assert pf.render_png_bytes(g, style, dpi=72)
@@ -205,7 +245,7 @@ def test_point_at_selects_the_knots_it_says_it_does(lifetables):
     for treatment, grp in data.groupby("treatment"):
         marked = set(events[events["treatment"] == treatment]["time"])
         grp = grp.sort_values("time")
-        fell = set(grp[grp["surv"].diff() < 0]["time"])
+        fell = set(grp[grp["value"].diff() < 0]["time"])
         assert marked == fell
 
     everything = pf.point_data(data, pf.PlotStyle(point_at="all"))
@@ -254,3 +294,25 @@ def test_font_family_resolves_to_something_installed():
     from matplotlib import font_manager
     installed = {f.name for f in font_manager.fontManager.ttflist}
     assert set(resolved) <= installed or resolved == ["DejaVu Sans"]
+
+
+def test_every_theme_renders_including_matplotlib(lifetables):
+    """theme_matplotlib is the one plotnine theme built from an rc dict, not
+    (base_size, base_family); passing those was a TypeError the moment the
+    theme was picked in the editor."""
+    spec = pf.default_spec("km_curves")
+    data = pf.series_data(lifetables, spec)
+    for theme in pf.THEMES:
+        style = pf.PlotStyle(theme=theme)
+        assert pf.render_png_bytes(pf.build_ggplot(data, spec, style),
+                                   style, dpi=60)
+
+
+def test_the_median_reference_is_seeded_only_on_survival_axes():
+    """0.5 marks median survival on a probability axis; on a hazard rate or a
+    count it marks nothing, so those specs start with no line."""
+    assert pf.default_spec("km_curves").reference_line == 0.5
+    assert pf.default_spec("km_faceted").reference_line == 0.5
+    for pid in ("nelson_aalen", "mortality", "hazard", "number_at_risk",
+                "hazard_ratio_forest", "survival_distribution"):
+        assert pf.default_spec(pid).reference_line is None, pid

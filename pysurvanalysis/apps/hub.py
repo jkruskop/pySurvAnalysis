@@ -269,16 +269,17 @@ class HubWindow(QMainWindow):
 
         ## A Batch Run touches every member of every Project, so the figure
         ## tabs it would open run into the hundreds and bury the Output tab
-        ## the user is actually reading. Checked, new tabs stop being created;
-        ## the Output tab keeps streaming and every artefact is still written
-        ## to disk. On by default, and deliberately NOT gated on a Batch being
-        ## selected — it applies to every run.
-        self._chk_suppress_tabs = QCheckBox("Suppress new plot tabs")
+        ## the user is actually reading. Checked, a BATCH RUN stops creating
+        ## tabs; the Output tab keeps streaming and every artefact is still
+        ## written to disk. Batch Runs only: a plot button clicked on one
+        ## experiment is a request to SEE that figure, and suppressing it
+        ## made the button do nothing visible.
+        self._chk_suppress_tabs = QCheckBox("Suppress plot tabs during batch runs")
         self._chk_suppress_tabs.setToolTip(
-            "Stop opening a tab for every figure. The Output tab keeps "
-            "updating and every figure is still written to disk — only the "
-            "tabs are skipped. Applies to all runs while it is checked, not "
-            "just Batch Runs.")
+            "Stop a Batch Run opening a tab for every figure of every member. "
+            "The Output tab keeps updating and every figure is still written "
+            "to disk — only the tabs are skipped. Plots requested directly on "
+            "an experiment always open.")
         self._chk_suppress_tabs.setChecked(True)
         card.add_body(self._chk_suppress_tabs)
 
@@ -515,10 +516,11 @@ class HubWindow(QMainWindow):
         render_btn = ActionButton("Render publication figures",
                                   Category.NEUTRAL, icon_name="figures")
         render_btn.setToolTip(
-            "Render every member's curated Publication Figures into its "
-            "figures/ folder. A member with no saved plots: in its "
-            "plot_specs.yaml is skipped and named, not rendered from the "
-            "Experiment Type's defaults — nobody asked for those (ADR-0005).")
+            "Render the Project's curated Publication Figures into each "
+            "member's figures/ folder. The curation is the Project's "
+            "plot_specs.yaml (ADR-0005 as amended): one set of Specs and "
+            "Styles, rendered per member. A Project with nothing curated "
+            "renders nothing.")
         render_btn.clicked.connect(self._action_render_figures)
         ## Action first, its modifier second: the button is what you came for,
         ## and the format is a detail of how it writes.
@@ -569,10 +571,25 @@ class HubWindow(QMainWindow):
         row.addWidget(QLabel("Active group:"))
         self._group_combo = QComboBox()
         self._group_combo.setEditable(True)
+        self._group_combo.setToolTip(
+            "The Exclusion Groups found in this experiment's "
+            "qc/remove_chambers.csv. Groups are created in the Chamber QC "
+            "viewer (flag chambers, then Save Exclusions… under a name) — "
+            "setting a name no group carries excludes nothing.")
         row.addWidget(self._group_combo, 1)
         card.add_body(row)
+        ## The empty state, said where it appears: an empty picker otherwise
+        ## reads as broken, when it just means nobody has saved a group yet.
+        self._group_hint = QLabel("")
+        self._group_hint.setWordWrap(True)
+        self._group_hint.setStyleSheet("color: palette(mid); font-style: italic;")
+        card.add_body(self._group_hint)
 
         apply_btn = ActionButton("Set active group", Category.QC, icon_name="check")
+        apply_btn.setToolTip(
+            "Write `exclusions: {group: …}` into survival_config.yaml. Every "
+            "future run drops that group's chambers and stamps the group on "
+            "its outputs; a blank name clears the key.")
         apply_btn.clicked.connect(self._action_set_exclusion_group)
         card.add_body(apply_btn)
 
@@ -1241,6 +1258,12 @@ class HubWindow(QMainWindow):
         from ..script_editor import actions as action_mod
 
         registry = action_mod.registry_for(self._experiment.type)
+        ## The render action stays in the registry — an Experiment Script may
+        ## legitimately render this member's figures — but its BUTTON is
+        ## project-level only: rendering walks every member, so it lives on
+        ## the Project panel and nowhere else.
+        registry = {k: a for k, a in registry.items()
+                    if k != "render_publication_figures"}
         order = [k for k in action_mod.CORE_KEYS if k in registry]
         order += [k for k in sorted(registry) if k not in order]
         for key in order:
@@ -1265,12 +1288,24 @@ class HubWindow(QMainWindow):
 
     def _refresh_exclusion_groups(self) -> None:
         self._group_combo.clear()
+        hint = getattr(self, "_group_hint", None)
         if self._experiment is None:
+            if hint is not None:
+                hint.setText("")
             return
         from .. import exclusions
 
         groups = exclusions.list_groups(self._experiment.directory)
         self._group_combo.addItems(groups)
+        if hint is not None:
+            if groups:
+                hint.setText("")
+            else:
+                hint.setText(
+                    "No groups yet — open the Chamber QC viewer, flag "
+                    "chambers, and Save Exclusions… under a name; it will be "
+                    "listed here. (Long-format data has no chambers, and "
+                    "then there is nothing to exclude.)")
         active = self._experiment.exclusion_group
         if active:
             idx = self._group_combo.findText(active)
@@ -1278,6 +1313,12 @@ class HubWindow(QMainWindow):
                 self._group_combo.setCurrentIndex(idx)
             else:
                 self._group_combo.setEditText(active)
+        ## A name typed here that no saved group carries excludes NOTHING —
+        ## warn beside the picker rather than let it look like a policy.
+        if active and groups and active not in groups and hint is not None:
+            hint.setText(
+                f"The active group {active!r} is not in "
+                f"qc/remove_chambers.csv — it currently excludes no chambers.")
 
     def _refresh_ai(self) -> None:
         from ..ai import narrative
@@ -1296,10 +1337,14 @@ class HubWindow(QMainWindow):
 
     # ── running work ───────────────────────────────────────────────────────
 
-    def _spawn(self, name: str, fn) -> None:
+    def _spawn(self, name: str, fn, *, batch: bool = False) -> None:
         if self._worker is not None and self._worker.isRunning():
             self._warn("A task is already running.")
             return
+        ## Whether THIS task's figures may be suppressed. Only a Batch Run
+        ## qualifies (see the checkbox); per-spawn state rather than a global,
+        ## so the answer cannot leak from one task to the next.
+        self._worker_is_batch = batch
         self._log.append_line(f"▶ {name}")
         worker = TaskWorker(name, fn)
         ## append_STREAM: log_text carries raw stdout chunks, and `print`
@@ -1327,17 +1372,23 @@ class HubWindow(QMainWindow):
             except Exception:  # noqa: BLE001
                 pass
             self._log.append_line(
-                f"[plot] {title} not shown — 'Suppress new plot tabs' is on "
-                "(Batch panel).")
+                f"[plot] {title} not shown — 'Suppress plot tabs during "
+                "batch runs' is on (Batch panel).")
             return
         self._plots.add_figure(title, figure)
 
     def _tabs_suppressed(self) -> bool:
-        """The Batch panel's 'Suppress new plot tabs' switch.
+        """True only while a Batch Run is up AND the switch is on.
 
-        Read through ``getattr`` because the log starts flowing before the
-        panels are built, and a task can outlive the panel that owns the box.
+        The switch never touches a figure the user asked for by clicking a
+        plot button on one experiment — that click is a request to SEE the
+        figure, and honouring the box there made the button do nothing
+        visible. Read through ``getattr`` because the log starts flowing
+        before the panels are built, and a task can outlive the panel that
+        owns the box.
         """
+        if not getattr(self, "_worker_is_batch", False):
+            return False
         box = getattr(self, "_chk_suppress_tabs", None)
         return box is not None and box.isChecked()
 
@@ -1406,7 +1457,8 @@ class HubWindow(QMainWindow):
         label = name or f"each project's own {DEFAULT_PROJECT_SCRIPT_NAME!r} script"
         self._spawn(f"Batch run: {label}",
                     lambda: batch.run(name, log=print,
-                                      project_names=keys).summary())
+                                      project_names=keys).summary(),
+                    batch=True)
 
     def _batch_checked_keys(self) -> list[str]:
         """The Projects checked in the Batch table, by key."""

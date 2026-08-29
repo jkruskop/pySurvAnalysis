@@ -1,0 +1,64 @@
+styles:
+  default:
+    width_mm: 120.0
+    height_mm: 90.0
+    theme: theme_classic
+    panel_bg: ''
+    panel_border: false
+    grid: none
+    font_family: codicon
+    base_size: 11.5
+    title_pt: 0.0
+    axis_title_pt: 0.0
+    tick_pt: 0.0
+    legend_pt: 0.0
+    strip_pt: 0.0
+    text_color: '#000000'
+    line_width: 0.9
+    line_pt: 0.8
+    show_points: true
+    point_at: events
+    point_shape: ^
+    point_size: 2.8
+    point_alpha: 1.0
+    point_stroke: 0.3
+    point_stroke_color: '#000000'
+    point_fill: ''
+    censor_ticks: true
+    censor_size: 2.0
+    censor_shape: '|'
+    censor_color: ''
+    ci_band: false
+    ci_alpha: 0.15
+    strip_style: plain
+    strip_bg: '#d9d9d9'
+    legend_position: right
+    risk_table: true
+    risk_table_times: []
+    risk_row_height: 0.075
+    risk_font_size: 7.0
+    palette: {}
+    palette_cycle:
+    - '#4C72B0'
+    - '#DD8452'
+    - '#55A868'
+    - '#C44E52'
+    - '#8172B3'
+    - '#937860'
+    - '#DA8BC3'
+    - '#8C8C8C'
+default_style: default
+plots:
+  km_curves:
+    style: default
+    title: ''
+    x_label: Age (days)
+    y_label: Survival probability
+    treatments: []
+    display_names: {}
+    series_label: Treatment
+    facet_by: ''
+    facet_order: []
+    x_limits: []
+    y_limits: []
+    reference_line: 0.5

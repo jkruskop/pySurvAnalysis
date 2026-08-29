@@ -178,8 +178,15 @@ _Avoid_: theme (a plotnine theme is one field inside a style)
 **Plot Spec**:
 One Publication Figure's content decisions — axis labels, treatment and facet
 inclusion/order/display names, axis limits, reference line — plus the name of
-the Plot Style it uses.
-_Avoid_: plot config, settings
+the Plot Style it uses. Specs and Styles live together in **one
+`plot_specs.yaml` at the container** (the Project, or a standalone Experiment
+Directory) — ADR-0005 as amended: the curation is the project default, and
+every member renders with it. The whole Plot Set is curatable, not just the
+KM curves; each plot's kind gates which Style features apply to it. Only
+figures **saved into** `plot_specs.yaml` are rendered — "Save this figure to
+project" writes one spec (and the Style it names) at a time, so a render
+produces the curated figures and nothing else.
+_Avoid_: plot config, settings, per-member spec (the superseded layout)
 
 **At-Risk Band**:
 The number-at-risk counts drawn as a `geom_text` layer in a reserved band
