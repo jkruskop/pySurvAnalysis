@@ -43,10 +43,34 @@ def _load_first_member(hub):
     hub._on_member_double_clicked(index)
 
 
-def test_the_strip_has_all_eight_tiles(hub):
+def test_the_strip_is_two_tiers(hub):
+    """Five ribbon tiles, with the four experiment-level surfaces one level
+    down behind the Experiment tile — they all wait on the same loaded
+    experiment, and four dimmed ribbon chips said that four times over."""
+    assert list(hub._tiles) == ["batch", "project", "experiment"]
     ## QC precedes Analyze: you decide what to exclude before you analyse it.
-    assert list(hub._tiles) == ["batch", "project", "qc", "analyze", "plots",
-                                "scripts", "ai", "tools"]
+    assert list(hub._subtiles) == ["qc", "analyze", "plots", "scripts", "ai"]
+    ## The wide tier: all three ribbon tiles share one width, 220% of a plain
+    ## tile's; the status panel takes the rest of the strip.
+    wide = [hub._tiles[k] for k in ("batch", "project", "experiment")]
+    assert len({t.minimumWidth() for t in wide}) == 1
+    assert wide[0].minimumWidth() == round(118 * 2.2)
+    ## Colour follows the sister app's tiles of the same name, so the two
+    ## Hubs read alike: Batch blue, Project slate, Experiment red, and the
+    ## sub-tiles their own categories.
+    from pysurvanalysis.ui import Category
+
+    assert hub._tiles["batch"]._category is Category.LOAD
+    assert hub._tiles["project"]._category is Category.NEUTRAL
+    assert hub._tiles["experiment"]._category is Category.QC
+    assert hub._subtiles["analyze"]._category is Category.ANALYZE
+    ## And the sub-panels are the narrow tier — a button column, not tables.
+    from pysurvanalysis.apps.hub import NARROW_PANEL_WIDTH, PANEL_WIDTH
+
+    for key in ("qc", "analyze", "plots", "scripts", "ai"):
+        assert hub._panels[key]._panel_width == NARROW_PANEL_WIDTH
+    for key in ("batch", "project", "experiment"):
+        assert hub._panels[key]._panel_width == PANEL_WIDTH
 
 
 def test_a_project_selection_lights_the_project_tile(hub):
@@ -69,11 +93,42 @@ def test_the_two_ways_in_are_never_dimmed(hub):
 
 
 def test_experiment_tiles_dim_until_something_is_loaded(hub):
-    for key in ("analyze", "qc", "plots", "scripts"):
-        assert hub._tiles[key].is_dimmed(), key
+    assert hub._tiles["experiment"].is_dimmed()
+    for key in ("qc", "analyze", "plots", "scripts"):
+        assert hub._subtiles[key].is_dimmed(), key
     _load_first_member(hub)
-    for key in ("analyze", "qc", "plots", "scripts"):
-        assert not hub._tiles[key].is_dimmed(), key
+    assert not hub._tiles["experiment"].is_dimmed()
+    for key in ("qc", "analyze", "plots", "scripts"):
+        assert not hub._subtiles[key].is_dimmed(), key
+
+
+def test_the_experiment_tile_refuses_to_open_with_nothing_loaded(hub):
+    """Its panel holds nothing but the four sub-tiles, all waiting on the
+    same missing thing — so unlike every other tile it is disabled, and the
+    log says where the fix is."""
+    assert hub._experiment is None
+    hub._toggle_panel("experiment")
+    assert hub._open_panel is None
+    _load_first_member(hub)
+    hub.close_panel()
+    hub._toggle_panel("experiment")
+    assert hub._open_panel == "experiment"
+    hub.close_panel()
+
+
+def test_a_sub_tile_opens_its_panel_anchored_at_the_experiment_tile(hub):
+    _shown(hub)
+    _load_first_member(hub)
+    hub._toggle_panel("experiment")
+    hub._subtiles["plots"].clicked.emit("plots")
+    assert hub._open_panel == "plots"
+    assert hub._panels["plots"].isVisible()
+    assert not hub._panels["experiment"].isVisible()
+    ## The ribbon shows where the panel hangs: the Experiment tile is the
+    ## anchor, and closing clears it.
+    assert hub._tiles["experiment"]._active
+    hub.close_panel()
+    assert not hub._tiles["experiment"]._active
 
 
 def test_the_members_table_is_the_way_to_load(hub):
@@ -132,10 +187,10 @@ def _button_labels(card) -> list[str]:
 def test_only_one_panel_is_open_at_a_time(hub):
     hub._toggle_panel("project")
     assert hub._open_panel == "project"
-    hub._toggle_panel("tools")
-    assert hub._open_panel == "tools"
+    hub._toggle_panel("batch")
+    assert hub._open_panel == "batch"
     assert not hub._panels["project"].isVisible()
-    hub._toggle_panel("tools")
+    hub._toggle_panel("batch")
     assert hub._open_panel is None
 
 
@@ -174,8 +229,10 @@ def test_a_press_outside_an_open_panel_closes_it(hub):
     ## missing handler raised inside a Qt event filter, which PyQt escalates
     ## to an abort — the Hub died on the first click after launch.
     _shown(hub)
-    for key in hub._tiles:
-        hub._toggle_panel(key)
+    _load_first_member(hub)          # so the Experiment tile opens too
+    hub.close_panel()
+    for key in list(hub._tiles) + list(hub._subtiles):
+        hub._toggle_panel(key) if key in hub._tiles else hub._open_panel_for(key)
         assert hub._open_panel == key and hub._panels[key].isVisible(), key
         _press(_blank_topbar_point(hub))
         assert hub._open_panel is None, key
@@ -199,6 +256,46 @@ def test_a_press_on_the_strip_is_left_to_the_tile(hub):
     hub._toggle_panel("batch")
     _press(hub._tiles["project"].mapToGlobal(QPoint(6, 6)))
     assert hub._open_panel == "project"
+
+
+def _press_with_bogus_globals(target):
+    """A left-press delivered to *target* whose global position points at
+    nothing — what a Wayland session effectively hands the filter, since a
+    window there has no screen position to map through."""
+    app = QApplication.instance()
+    event = QMouseEvent(QEvent.Type.MouseButtonPress, QPointF(4, 4),
+                        QPointF(-100000, -100000),
+                        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                        Qt.KeyboardModifier.NoModifier)
+    app.sendEvent(target, event)
+    app.processEvents()
+
+
+def test_a_sub_tile_press_opens_its_panel_without_trusting_global_coordinates(hub):
+    """Regression: a sub-tile press swaps panels (Experiment out, its own
+    narrow one in) and then, unaccepted, propagated on up to the tile's
+    ancestors — where the click-away filter judged it against the NEW panel
+    and closed it at once. Scripts and AI, the sub-tiles beyond the narrow
+    panel's width, never showed one. The tile accepts the press now, and the
+    filter hit-tests in window coordinates so it needs no screen position
+    (a Wayland window has none)."""
+    _shown(hub)
+    _load_first_member(hub)
+    for key in hub._subtiles:
+        hub.close_panel()
+        hub._toggle_panel("experiment")
+        assert hub._open_panel == "experiment"
+        _press_with_bogus_globals(hub._subtiles[key])
+        assert hub._open_panel == key, key
+        assert hub._panels[key].isVisible(), key
+    ## And a press that really lands outside still closes, coordinates or
+    ## not: the receiver says where it went.
+    _press_with_bogus_globals(hub._topbar)
+    assert hub._open_panel is None
+    ## The native-window delivery that precedes the widget one is not a hit.
+    hub._toggle_panel("batch")
+    hub._handle_click_away(hub.windowHandle(), None)
+    assert hub._open_panel == "batch"
 
 
 def test_a_resize_keeps_the_open_panel_anchored(hub):
@@ -881,15 +978,14 @@ def test_no_panel_asks_for_more_width_than_it_gets(hub, qapp):
     Measured against every panel, not just the one that broke: the failure is
     a button row whose labels do not fit, and any card can grow one.
     """
-    from pysurvanalysis.apps.hub import PANEL_WIDTH
-
     for key, panel in hub._panels.items():
         hub._open_panel_for(key)
         qapp.processEvents()
         host = panel._scroll.widget()
-        ## The panel's own frame margins and the host layout's, which the
+        ## Each panel's OWN width — the experiment sub-panels are narrower
+        ## than the container panels — minus the frame and host margins the
         ## content does not get (see TilePanel.__init__).
-        available = PANEL_WIDTH - 8 - 16
+        available = panel._panel_width - 8 - 16
         assert host.minimumSizeHint().width() <= available, (
             f"the {key} panel needs {host.minimumSizeHint().width()}px of "
             f"content width but has {available}px")
@@ -1220,3 +1316,67 @@ def test_pyplot_runs_on_agg_so_worker_figures_are_thread_safe(hub):
     import matplotlib
 
     assert matplotlib.get_backend().lower() == "agg"
+
+
+def test_the_facet_field_offers_the_real_factors(editor):
+    """A combo of the experiment's declared factors, not free text: a typed
+    name that matched nothing was silently ignored."""
+    items = [(editor._facet_by.itemText(i), editor._facet_by.itemData(i))
+             for i in range(editor._facet_by.count())]
+    assert items == [("(none)", ""), ("Genotype", "Genotype"),
+                     ("Treatment", "Treatment")]
+
+    editor._plot_combo.setCurrentText("km_faceted")
+    assert editor._facet_by.currentData() == "Genotype"   # the seeded default
+    editor._facet_by.setCurrentIndex(editor._facet_by.findData("Treatment"))
+    spec, _style = editor._harvest()
+    assert spec.facet_by == "Treatment"
+
+    editor._load_spec_into_form()                          # round-trips
+    assert editor._facet_by.currentData() == "Treatment"
+
+
+def test_apply_exclusions_is_a_script_step_not_a_button(hub):
+    """As a button it dropped a hard-coded group from a context discarded one
+    line later, while every real run already applies the config's active
+    Exclusion Group. In a script it is real: steps share a context, so a
+    script can run under a different group than the config's."""
+    from pysurvanalysis.script_editor import actions as action_mod
+
+    _load_first_member(hub)
+    labels = _button_labels(hub._analyze_card)
+    assert "Apply exclusions" not in labels
+    ## Same figures as the Chamber QC viewer, minus the flagging and Save
+    ## Exclusions that make the viewer worth opening — one way in, not two.
+    assert "Chamber QC overlay" not in labels
+    assert "Run analysis" in labels
+    registry = action_mod.registry_for(hub._experiment.type)
+    assert "apply_exclusions" in registry
+    assert "chamber_overlay_qc" in registry
+
+
+def test_the_tools_tile_is_gone(hub):
+    """Every Tools button duplicated a control that lives where the work is:
+    Validate config → the Project panel's Validate YAMLs (standalone case
+    included), Clear log → the output area's Clear output, Upgrade / Wrap in
+    a project → the Create/Load card's Create and Initialize. The freed strip
+    goes to the status panel."""
+    assert "tools" not in hub._tiles
+    assert "tools" not in hub._panels
+    assert not hasattr(hub, "_action_upgrade")
+    assert not hasattr(hub, "_action_wrap_in_project")
+    assert not hasattr(hub, "_action_open_analysis")
+
+
+def test_validate_yamls_checks_a_standalone_experiment(qapp, standalone):
+    """ADR-0003: a standalone loads without a Project, and its one config
+    still deserves the Validate button."""
+    from pysurvanalysis.apps.hub import HubWindow
+
+    window = HubWindow(str(standalone.directory))
+    try:
+        assert window._project is None and window._experiment is not None
+        window._action_validate_project()
+        assert "config is valid" in window._log.toPlainText()
+    finally:
+        window.close()

@@ -326,14 +326,27 @@ class PlotEditorWindow(QMainWindow):
         self._x_label = QLineEdit()
         self._y_label = QLineEdit()
         self._series_label = QLineEdit()
-        self._facet_by = QLineEdit()
         for label, widget in (("Title:", self._title_edit),
                               ("X label:", self._x_label),
                               ("Y label:", self._y_label),
-                              ("Legend title:", self._series_label),
-                              ("Facet by:", self._facet_by)):
+                              ("Legend title:", self._series_label)):
             widget.editingFinished.connect(self._refresh_preview)
             form.addRow(label, widget)
+
+        ## A combo of the experiment's REAL factors, not free text: the name
+        ## picks which factor becomes the panels (the other stays on the
+        ## curves), and a typed name that matched nothing used to be silently
+        ## ignored — the field looked live and did nothing.
+        self._facet_by = _combo([])
+        self._facet_by.addItem("(none)", "")
+        for factor in (self.experiment.config.get("factors") or {}):
+            self._facet_by.addItem(str(factor), str(factor))
+        self._facet_by.setToolTip(
+            "Which factor becomes the panels; the other stays on the curves. "
+            "Needs a factorial design — with no declared factors there is "
+            "nothing to facet by.")
+        self._facet_by.currentIndexChanged.connect(self._refresh_preview)
+        form.addRow("Facet by:", self._facet_by)
 
         ## Same pattern as the sister app and the reference line below:
         ## a checkbox says whether the axis is pinned at all, the pair says
@@ -443,6 +456,13 @@ class PlotEditorWindow(QMainWindow):
             "which is a different decision from the curve's own weight.")
         form.addRow("Curve width:", _row(self._line_width,
                                          QLabel("  axes:"), self._line_pt))
+
+        self._line_style = _combo(pf.LINE_STYLES)
+        self._line_style.setToolTip(
+            "How the knots are joined. auto follows the figure: a KM curve "
+            "is a step function, a smoothed hazard is not. step and line "
+            "override it either way — the confidence band follows along.")
+        form.addRow("Line style:", self._line_style)
 
         # ---- points ------------------------------------------------------
         self._show_points = QCheckBox("Draw points on the curve")
@@ -661,11 +681,14 @@ class PlotEditorWindow(QMainWindow):
         for widget, value in ((self._title_edit, spec.title),
                               (self._x_label, spec.x_label),
                               (self._y_label, spec.y_label),
-                              (self._series_label, spec.series_label),
-                              (self._facet_by, spec.facet_by)):
+                              (self._series_label, spec.series_label)):
             widget.blockSignals(True)
             widget.setText(value)
             widget.blockSignals(False)
+        self._facet_by.blockSignals(True)
+        index = self._facet_by.findData(spec.facet_by)
+        self._facet_by.setCurrentIndex(index if index >= 0 else 0)
+        self._facet_by.blockSignals(False)
         for check, lo, hi, limits in (
                 (self._xlim_check, self._xlim_lo, self._xlim_hi, spec.x_limits),
                 (self._ylim_check, self._ylim_lo, self._ylim_hi, spec.y_limits)):
@@ -712,6 +735,7 @@ class PlotEditorWindow(QMainWindow):
     )
     _CHOICES = (
         ("_theme_combo", "theme"), ("_legend_pos", "legend_position"),
+        ("_line_style", "line_style"),
         ("_point_at", "point_at"), ("_point_shape", "point_shape"),
         ("_censor_shape", "censor_shape"), ("_grid", "grid"),
         ("_strip_style", "strip_style"),
@@ -776,7 +800,7 @@ class PlotEditorWindow(QMainWindow):
             spec.x_label = self._x_label.text()
             spec.y_label = self._y_label.text()
             spec.series_label = self._series_label.text()
-            spec.facet_by = self._facet_by.text()
+            spec.facet_by = self._facet_by.currentData() or ""
             spec.reference_line = (self._reference_line.value()
                                    if self._ref_check.isChecked() else None)
             ## Sorted, so a lo/hi typed the wrong way round pins the range
@@ -846,6 +870,9 @@ class PlotEditorWindow(QMainWindow):
             for widget in widgets:
                 widget.setEnabled(enabled)
         self._facet_by.setEnabled(kind.faceted)
+        ## Joining knots is a series question; a forest, a density or an
+        ## interaction plot has no series of knots to join.
+        self._line_style.setEnabled(kind.geom in ("step", "line"))
 
     def _copy_style_from(self) -> None:
         """Overwrite this figure's style with another's, chosen by name."""

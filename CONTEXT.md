@@ -191,9 +191,14 @@ the Plot Style it uses. Specs and Styles live together in **one
 Directory) — ADR-0005 as amended: the curation is the project default, and
 every member renders with it. The whole Plot Set is curatable, not just the
 KM curves; each plot's kind gates which Style features apply to it. Only
-figures **saved into** `plot_specs.yaml` are rendered — "Save this figure to
-project" writes one spec (and the Style it names) at a time, so a render
-produces the curated figures and nothing else.
+figures **saved into** `plot_specs.yaml` are rendered — "Save Project
+default" writes one spec (and the Style it names) at a time, so a render
+produces the curated figures and nothing else. A curated figure also
+**outranks the analysis's own figure in the reports** (as in the sister app):
+the member report and the Project Report show a curated plot through its
+Spec + Style, at 200 dpi, and fall back to the default matplotlib figure only
+for plots nothing was curated for — a curated `km_curves` stands in for both
+default KM figures, since the at-risk band is a Style toggle there.
 _Avoid_: plot config, settings, per-member spec (the superseded layout)
 
 **At-Risk Band**:
@@ -205,10 +210,20 @@ _Avoid_: risk table (the matplotlib two-axes construction in `plotting.py`,
 which remains what the Hub preview and QC Viewer use)
 
 **Analysis Hub**:
-The main app: a horizontal tile strip — **Batch · Project · Analyze · QC ·
-Plots · Scripts · AI · Tools** — each tile showing only live status, with a
-status readout filling the strip to their right and a full-width output/plots
-area below. All controls live in a tile's anchored panel, one open at a time.
+The main app: a two-tier tile strip. The ribbon is exactly **Batch ·
+Project · Experiment** (one width, 220% of the old tile size), each showing
+only live status, with the status readout filling the rest of the strip and
+a full-width output/plots area below. There is no Tools tile: every tool it
+held duplicated a control that lives where the work is (Validate YAMLs on
+the Project card — which also validates a loaded standalone — Clear output
+on the output area, Create/Initialize on the Create/Load card). The **Experiment tile** fronts the five
+experiment-level surfaces — **QC · Analyze · Plots · Scripts · AI**, QC first
+because you decide what to exclude before you analyse it — as sub-tiles in
+its panel: all five wait on the same loaded experiment, and five dimmed
+ribbon chips said that five times over. A sub-tile opens the panel it
+always had, anchored under the Experiment tile; the Experiment tile itself is
+the one tile that is disabled (not merely dimmed) with nothing loaded, since
+its panel holds no fixer control, only the four gates. All controls live in a tile's anchored panel, one open at a time.
 The Analyze tile's cards are contributed by the loaded experiment's
 **Experiment Type**. The selection names the working container — a Batch, a
 Project, or a standalone Experiment Directory; a Member Experiment is loaded
@@ -250,6 +265,17 @@ what it is: the one a Batch Run executes in this Project unless another is
 designated. Written into the file rather than kept in code, so it is visible,
 editable and renameable. A Project whose `scripts:` is empty does not run.
 _Avoid_: default script (says nothing about when it runs)
+
+**`Standard analysis` script**:
+The Experiment Script every `survival_config.yaml` is created with (ADR-0007
+amendment) — the one a Project's `batch` script names in
+`run_in_experiments`, so a Batch Run works on a fresh Project with nothing
+authored. Seeded on the file's first write when it has no `scripts:` key at
+all, and left alone once the block exists (an empty list is a deletion).
+Resolution by name is the Project's central `experiment_scripts:`, then the
+member's own file, then the in-code built-in — the last only so a config
+written before the default was seeded still runs.
+_Avoid_: default script, built-in (it lives in the file, not in code)
 
 **Batch Run**:
 One execution of a designated Project Script in every **checked** Project of a
@@ -317,12 +343,12 @@ _Avoid_: adopt (reserved for ADR-0008's two ways a member arrives from
 outside the Project, which copy or move data), convert, import
 
 **Upgrade**:
-The non-destructive conversion of a pre-overhaul directory into an Experiment
-Directory: offered on open and available in Tools, it writes
-`survival_config.yaml` seeded by sniffing the data file, imports
-`survival_scripts.yaml` into the config's `scripts:`, copies
-`remove_chambers.csv` into `qc/`, and never touches `<stem>_results/`.
-_Avoid_: migration, conversion (Convert is a separate Batch Tool)
+The pre-overhaul → current layout rewrite (`domain/upgrade.py`): move a root
+`remove_chambers.csv` into `qc/`, sniff a config for an adopted workbook. No
+longer a Hub button — the Create/Load card's Initialize covers promoting old
+directories, and `sniff_config` keeps serving adoption — so `plan`/`apply`
+survive as library code only.
+_Avoid_: migration (overloaded), conversion
 
 **Run Summary**:
 `analysis/run_summary.json` — the small record of one analysis run (counts,

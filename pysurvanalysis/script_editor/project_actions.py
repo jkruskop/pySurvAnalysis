@@ -225,29 +225,59 @@ PROJECT_ACTIONS: dict[str, Action] = {
 # Built-in Project Scripts
 # ---------------------------------------------------------------------------
 
+#: The Experiment Script every ``survival_config.yaml`` is created with, and
+#: the one the built-in Project Scripts (and so every ``batch`` script) name
+#: in ``run_in_experiments``. The two defaults are a pair: a Batch Run works
+#: out of the box because the Project's ``batch`` script names this, and
+#: every member's file carries it.
+DEFAULT_EXPERIMENT_SCRIPT_NAME = "Standard analysis"
+
 BUILTIN_SCRIPTS: dict[str, list[dict]] = {
     "Standard pipeline": [
         {"action": "validate_project"},
-        {"action": "run_in_experiments", "script": "Standard analysis"},
+        {"action": "run_in_experiments", "script": DEFAULT_EXPERIMENT_SCRIPT_NAME},
         {"action": "render_publication_figures"},
         {"action": "project_report"},
     ],
     # Preferred for an unattended run: it does not gate on validation, which
     # would fail a Project mid-migration.
     "Report pipeline": [
-        {"action": "run_in_experiments", "script": "Standard analysis"},
+        {"action": "run_in_experiments", "script": DEFAULT_EXPERIMENT_SCRIPT_NAME},
         {"action": "render_publication_figures"},
         {"action": "project_report"},
     ],
 }
 
-#: The Experiment Script every member gets by default — named by the built-in
-#: Project Scripts above, and resolved from here when nothing defines it.
+#: The built-in Experiment Scripts, resolvable by name when neither the
+#: Project's central ``experiment_scripts:`` nor the member's own file defines
+#: one — which keeps a ``survival_config.yaml`` written before the default was
+#: seeded runnable.
 BUILTIN_EXPERIMENT_SCRIPTS: dict[str, list[dict]] = {
-    "Standard analysis": [
+    DEFAULT_EXPERIMENT_SCRIPT_NAME: [
         {"action": "run_analysis"},
     ],
 }
+
+
+def default_experiment_script() -> dict:
+    """A fresh copy of the default Experiment Script, for seeding a
+    ``survival_config.yaml``.
+
+    The experiment-level counterpart of :func:`default_project_script`: written
+    into the file rather than left in code so a user reading their config can
+    see what the Project's ``batch`` script will run here, and change it.
+    """
+    return {
+        "name": DEFAULT_EXPERIMENT_SCRIPT_NAME,
+        "notes": ("Created with the experiment, and what the Project's `batch` "
+                  "script runs in every member through run_in_experiments. "
+                  "Runs the Experiment Type's standard analysis battery into "
+                  "analysis/. Edit or replace it in the Script Editor; a "
+                  "script of the same name in the Project's central "
+                  "experiment_scripts: takes precedence."),
+        "steps": [dict(step) for step in
+                  BUILTIN_EXPERIMENT_SCRIPTS[DEFAULT_EXPERIMENT_SCRIPT_NAME]],
+    }
 
 
 #: The Project Script every ``project.yaml`` is created with. It is named

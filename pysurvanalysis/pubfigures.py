@@ -68,6 +68,10 @@ class PlotStyle:
 
     # ── curves ─────────────────────────────────────────────────────────────
     line_width: float = 0.9
+    #: How the knots are joined: ``auto`` follows the plot kind (a KM curve
+    #: IS a step function; a smoothed hazard is not), ``step`` and ``line``
+    #: override it either way.
+    line_style: str = "auto"          # auto | step | line
     #: Weight (pt) of axis lines, ticks and panel/strip borders — the figure's
     #: furniture, which is not the same decision as the curve's own weight.
     line_pt: float = 0.8
@@ -522,8 +526,36 @@ def _derived(grp: pd.DataFrame, kind: PlotKind, smoothing: float = 3.0) -> pd.Da
     return grp
 
 
+def _facet_split(spec: PlotSpec, factors: tuple[str, ...]) -> tuple[int, int]:
+    """Which half of a composite ``a/b`` treatment label is the facet.
+
+    ``facet_by`` names a FACTOR, and the composite label is factor 1's level
+    ``/`` factor 2's level — so naming factor 2 puts part 1 in the panels and
+    part 0 on the curves. The name used to be ignored entirely (any non-empty
+    string faceted by factor 1), which made the editor's field a decoy.
+    An unknown name keeps the factor-1 default rather than failing a render.
+    """
+    if len(factors) > 1 and spec.facet_by == str(factors[1]):
+        return 1, 0
+    return 0, 1
+
+
+def _apply_facet(data: pd.DataFrame, spec: PlotSpec,
+                 factors: tuple[str, ...]) -> pd.DataFrame:
+    """Split composite treatment labels into panel and series columns."""
+    parts = data["treatment"].str.split("/", n=1, expand=True)
+    if parts.shape[1] == 2:
+        facet_part, series_part = _facet_split(spec, factors)
+        data["_facet"] = parts[facet_part]
+        data["_series"] = parts[series_part]
+        data["label"] = data["_series"].map(
+            lambda s: spec.display_names.get(s, s))
+    return data
+
+
 def series_data(lifetables: pd.DataFrame, spec: PlotSpec,
-                kind: PlotKind | None = None) -> pd.DataFrame:
+                kind: PlotKind | None = None,
+                factors: tuple[str, ...] = ()) -> pd.DataFrame:
     """Per-treatment ``(x, value)`` knots for one series-shaped plot.
 
     One preparation for nine plots: they differ in which lifetable column is
@@ -574,10 +606,7 @@ def series_data(lifetables: pd.DataFrame, spec: PlotSpec,
         return pd.DataFrame(columns=["time", "value", "treatment", "label"])
     data = pd.concat(frames, ignore_index=True)
     if spec.facet_by:
-        parts = data["treatment"].str.split("/", n=1, expand=True)
-        if parts.shape[1] == 2:
-            data["_facet"], data["_series"] = parts[0], parts[1]
-            data["label"] = data["_series"]
+        data = _apply_facet(data, spec, factors)
     return data
 
 
@@ -642,6 +671,20 @@ FILLED_SHAPES = ("o", "s", "^", "v", "D", "d", "p", "h", "*")
 
 #: Which knots of a curve carry a marker.
 POINT_AT = ("events", "censored", "all")
+
+#: How a series' knots are joined. ``auto`` = the plot kind's own geometry.
+LINE_STYLES = ("auto", "step", "line")
+
+
+def effective_geom(style: PlotStyle, kind: PlotKind) -> str:
+    """``"step"`` or ``"line"`` — the Style's choice, else the kind's own.
+
+    One resolver, used by the curve layer AND the confidence band: a band
+    stepped one way under a curve drawn the other would bound nothing.
+    """
+    if style.line_style in ("step", "line"):
+        return style.line_style
+    return kind.geom
 
 
 def point_data(data: pd.DataFrame, style: PlotStyle,
@@ -751,7 +794,8 @@ def _build_series(data: pd.DataFrame, spec: PlotSpec, style: PlotStyle,
     labels = list(dict.fromkeys(data[series_col]))
     colours = style.colour_for(labels)
 
-    line = p9.geom_step if kind.geom == "step" else p9.geom_line
+    geom = effective_geom(style, kind)
+    line = p9.geom_step if geom == "step" else p9.geom_line
     g = (p9.ggplot(data, p9.aes(x="time", y="value", color=series_col))
          + line(size=style.line_width))
     ## Both the band and filled points map `fill`, and plotnine warns and
@@ -766,7 +810,7 @@ def _build_series(data: pd.DataFrame, spec: PlotSpec, style: PlotStyle,
         ## stat or layer"), which is what this used to raise the moment anyone
         ## ticked the box.
         band = (step_expand(data, group_cols=(series_col, "_facet"))
-                if kind.geom == "step" else data)
+                if geom == "step" else data)
         g = g + p9.geom_ribbon(
             data=band,
             mapping=p9.aes(x="time", ymin="ci_lo", ymax="ci_hi",
@@ -1107,8 +1151,8 @@ def forest_data(hazard_ratios: pd.DataFrame, spec: PlotSpec) -> pd.DataFrame:
     return out[(out["ratio"] > 0) & (out["ci_lo"] > 0)]
 
 
-def distribution_data(individual_data: pd.DataFrame,
-                      spec: PlotSpec) -> pd.DataFrame:
+def distribution_data(individual_data: pd.DataFrame, spec: PlotSpec,
+                      factors: tuple[str, ...] = ()) -> pd.DataFrame:
     """One row per individual death: the lifespan and its treatment.
 
     Censored individuals are excluded — their lifespan is unknown, not the
@@ -1130,10 +1174,7 @@ def distribution_data(individual_data: pd.DataFrame,
     out["label"] = out["treatment"].map(
         lambda t: spec.display_names.get(t, t))
     if spec.facet_by:
-        parts = out["treatment"].str.split("/", n=1, expand=True)
-        if parts.shape[1] == 2:
-            out["_facet"], out["_series"] = parts[0], parts[1]
-            out["label"] = out["_series"]
+        out = _apply_facet(out, spec, factors)
     return out
 
 
@@ -1183,15 +1224,16 @@ def data_for(experiment, spec: PlotSpec,
     and interactions, the saved hazard ratios for the forest.
     """
     kind = kind_for(spec)
+    factors = tuple(experiment.config.get("factors") or {})
     if kind.source == "lifetables":
         lt = lifetables if lifetables is not None else _load_lifetables(experiment)
-        return series_data(lt, spec, kind)
+        return series_data(lt, spec, kind, factors=factors)
     if kind.source == "hazard_ratios":
         return forest_data(_load_hazard_ratios(experiment), spec)
     individual = _load_individual_data(experiment)
     if kind.geom == "interaction":
         return interaction_data(individual, spec)
-    return distribution_data(individual, spec)
+    return distribution_data(individual, spec, factors=factors)
 
 
 def _load_individual_data(experiment) -> pd.DataFrame:

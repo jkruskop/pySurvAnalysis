@@ -64,6 +64,41 @@ def test_builtin_experiment_script_is_valid_for_every_type():
             assert actions.validate_steps(steps, get_type(key)) == []
 
 
+def test_the_batch_script_names_the_default_experiment_script():
+    """The two defaults are a pair: a fresh Project's `batch` script must
+    name a script every fresh member's file actually carries."""
+    default = project_actions.default_experiment_script()
+    assert default["name"] == project_actions.DEFAULT_EXPERIMENT_SCRIPT_NAME
+    assert default["notes"]
+    named = {step["script"] for step in project_actions.default_project_script()["steps"]
+             if step["action"] == "run_in_experiments"}
+    assert named == {default["name"]}
+    for key in ("standard_lifespan", "interaction", None):
+        assert actions.validate_steps(default["steps"], get_type(key)) == []
+
+
+def test_run_in_experiments_reads_the_members_own_default_script(project):
+    """The seeded script is the one that runs — edit it in the file and the
+    edit is what run_in_experiments executes, not the in-code built-in."""
+    from pysurvanalysis.domain import config as cfgmod
+
+    member = project.members()[0]
+    config = cfgmod.load_config(member.directory)
+    config["scripts"] = [{"name": project_actions.DEFAULT_EXPERIMENT_SCRIPT_NAME,
+                          "steps": [{"action": "not_an_action"}]}]
+    cfgmod.save_config(member.directory, config)
+
+    from pysurvanalysis.domain import Project
+
+    reloaded = Project(project.directory)
+    with pytest.raises(RuntimeError, match="cannot run as a"):
+        project_actions.run_script(
+            reloaded, [{"action": "run_in_experiments",
+                        "script": project_actions.DEFAULT_EXPERIMENT_SCRIPT_NAME,
+                        "only": [member.name]}],
+            log=lambda _m: None)
+
+
 def test_run_in_experiments_refuses_a_script_the_type_cannot_run(project):
     """A hard error, not a skip: a silently skipped step reports as complete."""
     config = dict(project.config)

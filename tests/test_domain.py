@@ -126,6 +126,48 @@ def test_a_project_without_scripts_is_seeded_on_the_next_write(tmp_path):
     assert Project(project.directory).scripts() == []
 
 
+def test_a_scaffolded_member_ships_the_default_experiment_script(project):
+    from pysurvanalysis.script_editor.project_actions import (
+        DEFAULT_EXPERIMENT_SCRIPT_NAME,
+    )
+
+    member = project.add_member("rep_c")
+    ## Written into the file, not resolved from code: a user reading the
+    ## member's config sees what the Project's `batch` script runs here.
+    written = cfgmod.read_yaml(member.config_path)
+    assert [s["name"] for s in written["scripts"]] == [DEFAULT_EXPERIMENT_SCRIPT_NAME]
+    assert written["scripts"][0]["notes"]
+    assert written["scripts"][0]["steps"] == [{"action": "run_analysis"}]
+    assert DEFAULT_EXPERIMENT_SCRIPT_NAME in {s["name"] for s in member.scripts()}
+
+
+def test_an_adopted_member_ships_the_default_experiment_script(project, tmp_path):
+    from pysurvanalysis.script_editor.project_actions import (
+        DEFAULT_EXPERIMENT_SCRIPT_NAME,
+    )
+
+    source = tmp_path / "cohort_z"
+    write_dlife_workbook(source / "data" / "cohort_z.xlsx")
+    member = project.adopt_directory(source)
+    written = cfgmod.read_yaml(member.config_path)
+    assert [s["name"] for s in written["scripts"]] == [DEFAULT_EXPERIMENT_SCRIPT_NAME]
+
+
+def test_a_config_without_scripts_is_seeded_on_write_but_an_empty_one_is_kept(tmp_path):
+    from pysurvanalysis.script_editor.project_actions import (
+        DEFAULT_EXPERIMENT_SCRIPT_NAME,
+    )
+
+    d = tmp_path / "lone"
+    cfgmod.save_config(d, {"experiment_type": "standard_lifespan"})
+    assert [s["name"] for s in cfgmod.scripts_of(cfgmod.load_config(d))] \
+        == [DEFAULT_EXPERIMENT_SCRIPT_NAME]
+
+    ## An authored block is never re-seeded: an empty list is a deletion.
+    cfgmod.save_config(d, {"experiment_type": "standard_lifespan", "scripts": []})
+    assert cfgmod.load_config(d)["scripts"] == []
+
+
 def test_add_member_scaffolds_from_the_defaults(project):
     member = project.add_member("rep_c")
     assert member.type.key == "interaction"

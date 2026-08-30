@@ -151,6 +151,27 @@ def test_upgrade_imports_scripts_and_the_active_group(tmp_path):
     assert config["input"]["format"] == "long"
 
 
+def test_upgrade_seeds_the_default_script_unless_legacy_scripts_are_imported(tmp_path):
+    from pysurvanalysis.script_editor.project_actions import (
+        DEFAULT_EXPERIMENT_SCRIPT_NAME,
+    )
+
+    ## Legacy scripts are an authored block: imported as-is, not appended to.
+    legacy = _legacy_dir(tmp_path)
+    plan = upgrade.plan(legacy)
+    assert [s["name"] for s in plan.proposed_config["scripts"]] == ["Quick"]
+    assert not any("seed" in a for a in plan.actions)
+
+    ## No scripts anywhere: the plan shows the seed and the file carries it.
+    bare = tmp_path / "bare"
+    write_cohort(bare / "cohort.csv")
+    plan = upgrade.plan(bare)
+    assert any(DEFAULT_EXPERIMENT_SCRIPT_NAME in a for a in plan.actions)
+    upgrade.apply(plan)
+    config = cfgmod.load_config(bare)
+    assert [s["name"] for s in cfgmod.scripts_of(config)] == [DEFAULT_EXPERIMENT_SCRIPT_NAME]
+
+
 def test_upgrading_an_upgraded_directory_is_a_no_op(tmp_path):
     directory = _legacy_dir(tmp_path)
     upgrade.apply(upgrade.plan(directory))

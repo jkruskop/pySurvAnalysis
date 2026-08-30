@@ -338,3 +338,67 @@ def test_axis_limits_reach_every_numeric_axis(project):
         style = pf.PlotStyle()
         assert pf.render_png_bytes(pf.build_ggplot(frame, spec, style),
                                    style, dpi=60), plot_id
+
+
+def test_facet_by_selects_which_factor_becomes_the_panels(project):
+    """The name in ``facet_by`` picks the factor: naming factor 2 puts its
+    levels in the panels and factor 1 on the curves. It used to be a boolean
+    in disguise — any non-empty string faceted by factor 1, and the editor's
+    field was a decoy."""
+    member = project.member("rep_a")
+
+    spec = pf.default_spec("km_faceted")
+    spec.facet_by = "Genotype"
+    data = pf.data_for(member, spec)
+    assert sorted(set(data["_facet"])) == ["mut", "wt"]
+    assert sorted(set(data["_series"])) == ["ctrl", "drug"]
+
+    spec.facet_by = "Treatment"
+    data = pf.data_for(member, spec)
+    assert sorted(set(data["_facet"])) == ["ctrl", "drug"]
+    assert sorted(set(data["_series"])) == ["mut", "wt"]
+
+    ## An unknown name keeps the factor-1 default rather than failing a
+    ## headless render over a hand-edited yaml.
+    spec.facet_by = "NotAFactor"
+    data = pf.data_for(member, spec)
+    assert sorted(set(data["_facet"])) == ["mut", "wt"]
+
+
+def test_line_style_overrides_the_kinds_geometry(lifetables):
+    """``auto`` follows the plot kind; ``step``/``line`` override it, and the
+    confidence band is stepped the same way the curve is drawn — a band
+    stepped one way under a curve drawn the other would bound nothing."""
+    import plotnine as p9
+
+    km = pf.default_spec("km_curves")
+    mortality = pf.default_spec("mortality")
+    data_km = pf.series_data(lifetables, km)
+
+    def curve_geom(spec, style):
+        g = pf.build_ggplot(pf.series_data(lifetables, spec), spec, style)
+        return type(g.layers[0].geom)
+
+    assert curve_geom(km, pf.PlotStyle()) is p9.geom_step
+    assert curve_geom(mortality, pf.PlotStyle()) is p9.geom_line
+    assert curve_geom(km, pf.PlotStyle(line_style="line")) is p9.geom_line
+    assert curve_geom(mortality, pf.PlotStyle(line_style="step")) is p9.geom_step
+
+    ## The band follows the effective geometry, not the kind's: drawn as
+    ## direct lines, the band data must NOT be step-expanded.
+    stepped = pf.build_ggplot(data_km, km, pf.PlotStyle(ci_band=True))
+    direct = pf.build_ggplot(data_km, km,
+                             pf.PlotStyle(ci_band=True, line_style="line"))
+    def band_rows(g):
+        ribbon = next(l for l in g.layers
+                      if isinstance(l.geom, p9.geom_ribbon))
+        return len(ribbon._data)          # the layer's own frame (0.15 API)
+    assert band_rows(stepped) > band_rows(direct)
+    assert band_rows(direct) == len(data_km)
+
+    ## And both render.
+    for style in (pf.PlotStyle(line_style="line", ci_band=True,
+                               show_points=True),
+                  pf.PlotStyle(line_style="step")):
+        assert pf.render_png_bytes(pf.build_ggplot(data_km, km, style),
+                                   style, dpi=60)

@@ -173,8 +173,51 @@ def _section_summary(result) -> list:
     return blocks
 
 
+#: Raster resolution for a curated figure placed in the report — the sister
+#: app's report figures render at the same, and a page needs more than the
+#: preview's screen resolution.
+_REPORT_FIGURE_DPI = 200
+
+
+def _curated_figure(result, plot_id: str, specs, title: str,
+                    caption: str | None):
+    """The Publication Figure curated for *plot_id*, as a report block — or
+    ``None`` when nothing is curated for it, or rendering it failed.
+
+    A curated figure outranks the analysis's own matplotlib PNG: the whole
+    point of curating in the Plot Editor is that THIS is the figure the
+    experiment is meant to be seen through, and a report showing a different
+    one beside it would be two figures disagreeing about one result. The
+    default stays as the fallback, never the other way round.
+    """
+    from . import pubfigures
+
+    experiment = getattr(result, "experiment", None)
+    if experiment is None or specs is None:
+        return None
+    spec = specs.get(pubfigures._SPEC_ALIASES.get(plot_id, plot_id))
+    if spec is None:
+        return None
+    try:
+        style = pubfigures.resolve_style(spec.style, experiment)
+        frame = pubfigures.data_for(experiment, spec)
+        if frame.empty:
+            return None
+        figure = pubfigures.build_ggplot(frame, spec, style)
+        data = pubfigures.render_png_bytes(figure, style, dpi=_REPORT_FIGURE_DPI)
+    except Exception:  # noqa: BLE001 - a broken curation must not sink the report
+        return None
+    return m.Figure(
+        data=data, fmt="png",
+        width_in=float(style.width_mm) / 25.4,
+        height_in=float(style.height_mm) / 25.4,
+        title=f"{title} — curated figure",
+        caption=caption,
+    )
+
+
 def _section_figures(result) -> list:
-    from . import plot_registry
+    from . import plot_registry, pubfigures
 
     blocks: list = []
     paths = getattr(result, "figure_paths", {}) or {}
@@ -182,16 +225,41 @@ def _section_figures(result) -> list:
     headline = getattr(exp_type, "headline_plot_id", None)
     order = [headline] + [pid for pid in paths if pid != headline] if headline in paths \
         else list(paths)
+
+    ## What the Plot Editor curated for this experiment's container, read
+    ## once. None (not {}) when there is no experiment to ask, so the loop
+    ## below cannot mistake "unknown" for "nothing curated".
+    experiment = getattr(result, "experiment", None)
+    specs = None
+    if experiment is not None:
+        try:
+            specs = pubfigures.adopt_legacy_member_specs(experiment).plots
+        except Exception:  # noqa: BLE001
+            specs = None
+
+    placed: set[str] = set()
     for plot_id in order:
         path = paths.get(plot_id)
         if path is None:
             continue
         try:
-            spec = plot_registry.get(plot_id)
+            registry_spec = plot_registry.get(plot_id)
         except KeyError:
             continue
-        label = spec.label + (" — headline figure" if plot_id == headline else "")
-        block = figure_block(path, title=label, caption=spec.caption)
+        label = registry_spec.label + (" — headline figure" if plot_id == headline else "")
+
+        ## The two default KM figures are one curated figure (the at-risk band
+        ## is a Style toggle there), so a curated km_curves stands in for BOTH
+        ## and the second default is dropped rather than shown beside it.
+        curated_id = pubfigures._SPEC_ALIASES.get(plot_id, plot_id)
+        if curated_id in placed:
+            continue
+        block = _curated_figure(result, plot_id, specs, label,
+                                registry_spec.caption)
+        if block is not None:
+            placed.add(curated_id)
+        else:
+            block = figure_block(path, title=label, caption=registry_spec.caption)
         if block:
             blocks.append(block)
     return blocks

@@ -84,6 +84,20 @@ def write_yaml(path: str | Path, data: dict) -> Path:
 
 
 def save_config(directory: str | Path, config: dict) -> Path:
+    """Write a directory's ``survival_config.yaml``.
+
+    A config with no ``scripts:`` key at all is seeded with the default
+    Experiment Script on the way out — the rule :meth:`Project.save` applies
+    to ``project.yaml`` (ADR-0007), one level down: every Experiment Directory
+    ships a visible, editable ``Standard analysis``, the script a Project's
+    ``batch`` script runs in each member. An existing block is never touched —
+    an empty list is a deliberate deletion, and re-seeding it would undo the
+    user's edit. The config is updated in place so memory matches disk.
+    """
+    if "scripts" not in config:
+        from ..script_editor.project_actions import default_experiment_script
+
+        config["scripts"] = [default_experiment_script()]
     return write_yaml(config_path(directory), config)
 
 

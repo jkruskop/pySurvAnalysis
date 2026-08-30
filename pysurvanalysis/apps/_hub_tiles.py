@@ -52,7 +52,11 @@ class StatusTile(QFrame):
     _MAX_LINE_CHARS = 26
 
     def __init__(self, key: str, title: str, icon_name: str,
-                 category: Category, parent: QWidget | None = None) -> None:
+                 category: Category, parent: QWidget | None = None, *,
+                 wide: bool = False, min_width: int | None = None,
+                 max_width: int | None = None,
+                 line_chars: int | None = None,
+                 compact: bool = False) -> None:
         super().__init__(parent)
         self.key = key
         self._category = category
@@ -64,14 +68,33 @@ class StatusTile(QFrame):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         ## A width RANGE, not a fixed size: six fixed 196px tiles forced a
         ## 1416px minimum window that no 1366x768 laptop could show.
+        ## ``wide`` is the ribbon's 175% tier — Batch / Project / Experiment
+        ## match each other and leave the rest of the strip to the status
+        ## panel. ``max_width`` lets a sub-tile grid stretch its chips to
+        ## fill its panel column.
         self.setSizePolicy(QSizePolicy.Policy.Preferred,
                            QSizePolicy.Policy.Fixed)
-        self.setMinimumWidth(118)
-        self.setMaximumWidth(196)
-        self.setFixedHeight(84)
+        ## The wide tier has grown once since: 1.75 → 2.2 (+25%), bought
+        ## from the retired ribbon tiles, so the summaries can say more.
+        scale = 2.2 if wide else 1.0
+        ## Compact: an icon-and-title chip, no summary lines — for a nav row
+        ## where the live status would only repeat what the panel says.
+        self._compact = compact
+        self.setMinimumWidth(min_width if min_width is not None
+                             else round((90 if compact else 118) * scale))
+        self.setMaximumWidth(max_width if max_width is not None
+                             else round(196 * scale))
+        self.setFixedHeight(38 if compact else 84)
+        ## Per-tile cap: a compact sub-tile clips sooner than a ribbon tile,
+        ## and the untruncated text is on the tooltip either way.
+        self._line_chars = (line_chars if line_chars is not None
+                            else (40 if wide else self._MAX_LINE_CHARS))
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(10, 6, 10, 6)
+        if compact:
+            lay.setContentsMargins(8, 4, 8, 4)
+        else:
+            lay.setContentsMargins(10, 6, 10, 6)
         lay.setSpacing(2)
 
         head = QHBoxLayout()
@@ -88,8 +111,11 @@ class StatusTile(QFrame):
         self._summary_lbl = QLabel("")
         self._summary_lbl.setStyleSheet("font-size: 9pt;")
         self._summary_lbl.setTextFormat(Qt.TextFormat.PlainText)
-        lay.addWidget(self._summary_lbl, 1,
-                      Qt.AlignmentFlag.AlignTop)
+        if compact:
+            self._summary_lbl.hide()
+        else:
+            lay.addWidget(self._summary_lbl, 1,
+                          Qt.AlignmentFlag.AlignTop)
         self._restyle()
 
     # ------------------------------------------------------------------
@@ -98,11 +124,13 @@ class StatusTile(QFrame):
         full = [str(line) for line in lines]
         clipped = []
         for line in full[:2]:
-            if len(line) > self._MAX_LINE_CHARS:
-                line = line[: self._MAX_LINE_CHARS - 1] + "…"
+            if len(line) > self._line_chars:
+                line = line[: self._line_chars - 1] + "…"
             clipped.append(line)
-        self._summary_lbl.setText("\n".join(clipped))
-        ## The untruncated summary is always one hover away.
+        if not self._compact:
+            self._summary_lbl.setText("\n".join(clipped))
+        ## The untruncated summary is always one hover away — a compact chip
+        ## keeps the live status THERE rather than displaying it.
         self.setToolTip("\n".join(full))
 
     def summary_text(self) -> str:
@@ -161,15 +189,28 @@ class StatusTile(QFrame):
             f"border-bottom-right-radius: {right}px; }} "
             f"QLabel {{ color: {pop}; background: transparent; "
             "border: none; }")
+        ## The compact chip trades a point of size and the tracking for its
+        ## width: at 9pt + 0.06em, "ANALYZE" alone outgrew a five-across row.
+        size, tracking = ("8pt", "0.02em") if self._compact else ("9pt", "0.06em")
         self._title_lbl.setStyleSheet(
-            f"color: {title}; font-weight: 700; font-size: 9pt; "
-            "letter-spacing: 0.06em;")
+            f"color: {title}; font-weight: 700; font-size: {size}; "
+            f"letter-spacing: {tracking};")
         mode = QIcon.Mode.Disabled if self._dimmed else QIcon.Mode.Normal
         self._icon_lbl.setPixmap(self._icon.pixmap(QSize(16, 16), mode))
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt override)
         if event.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit(self.key)
+            ## Accepted, not passed to QFrame (which ignores it): an ignored
+            ## press is re-delivered to every ancestor, and by then the click
+            ## handler has swapped panels — a sub-tile hides the Experiment
+            ## panel it sits in and opens its own, narrower one. The Hub's
+            ## click-away filter, seeing the late delivery, judged the press
+            ## to be outside the panel now open and closed it on the spot.
+            ## Sub-tiles beyond the narrow panel's width (Scripts, AI) never
+            ## showed a panel at all.
+            event.accept()
+            return
         super().mousePressEvent(event)
 
 
@@ -343,7 +384,10 @@ class ClickAwayFilter(QObject):
         try:
             if event.type() == QEvent.Type.MouseButtonPress \
                     and QThread.currentThread() is self.thread():
-                self._owner._handle_click_away(event)
+                ## The receiver goes along with the event: it IS the widget
+                ## under the cursor, which the owner must not re-derive from
+                ## the event's global position (see _handle_click_away).
+                self._owner._handle_click_away(obj, event)
         except RuntimeError:
             pass  # owner already destroyed
         return False

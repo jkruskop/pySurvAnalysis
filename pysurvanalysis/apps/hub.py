@@ -66,7 +66,6 @@ from ..domain import (
     is_experiment_dir,
     is_project_dir,
     layout as layout_mod,
-    upgrade as upgrade_mod,
 )
 from ..script_editor.project_actions import DEFAULT_PROJECT_SCRIPT_NAME
 from ..ui import (
@@ -87,17 +86,40 @@ from .common import TaskWorker
 
 PANEL_WIDTH = 540
 
-#: key, title, icon, category — the strip, left to right.
+#: The five experiment sub-panels hold a column of buttons, and a button
+#: stretched across 540px was mostly padding — their content needs ~270px.
+#: The Batch/Project/Experiment panels keep the full width for their tables
+#: and the sub-tile row.
+NARROW_PANEL_WIDTH = 350
+_PANEL_WIDTHS = {key: NARROW_PANEL_WIDTH
+                 for key in ("qc", "analyze", "plots", "scripts", "ai")}
+
+#: key, title, icon, category — the strip, left to right. The first three
+#: are the wide tier (Batch · Project · Experiment, all one width); the
+#: status panel takes what is left of the strip.
+#: Categories match the sister app's tiles of the same name, so anyone
+#: moving between the two reads the same colour as the same place: Batch
+#: blue (LOAD), Project slate (NEUTRAL), Experiment red (QC).
 TILES = (
-    ("batch", "Batch", "batch", Category.NEUTRAL),
+    ("batch", "Batch", "batch", Category.LOAD),
     ("project", "Project", "project", Category.NEUTRAL),
+    ("experiment", "Experiment", "experiment", Category.QC),
+)
+
+#: The experiment-level surfaces, one level down: the Experiment tile opens a
+#: grid of these, and each sub-tile opens the panel it always had. They are
+#: sub-tiles because all four wait on the same thing — a loaded experiment —
+#: and four dimmed ribbon chips said that four times over.
+SUBTILES = (
     ("qc", "QC", "qc", Category.QC),
     ("analyze", "Analyze", "analyze", Category.ANALYZE),
     ("plots", "Plots", "plots", Category.PLOTS),
     ("scripts", "Scripts", "scripts", Category.SCRIPTS),
     ("ai", "AI", "ai", Category.AI),
-    ("tools", "Tools", "tools", Category.TOOLS),
 )
+
+#: Ribbon tiles drawn at 220% width.
+_WIDE_TILES = {"batch", "project", "experiment"}
 
 
 #: The Batch picker's leading entry — designates nothing (see ADR: no
@@ -164,7 +186,8 @@ class HubWindow(QMainWindow):
         strip_lay.setContentsMargins(0, 0, 0, 0)
         strip_lay.setSpacing(1)
         for i, (key, title, icon_name, category) in enumerate(TILES):
-            tile = StatusTile(key, title, icon_name, category)
+            tile = StatusTile(key, title, icon_name, category,
+                              wide=key in _WIDE_TILES)
             tile.set_rounding(8 if i == 0 else 0, 0)
             tile.clicked.connect(self._toggle_panel)
             self._tiles[key] = tile
@@ -180,20 +203,21 @@ class HubWindow(QMainWindow):
         outer.addWidget(self._plots, 1)
 
         self._central = central
-        for key, *_ in TILES:
-            panel = TilePanel(key, PANEL_WIDTH, central)
+        for key, *_ in TILES + SUBTILES:
+            panel = TilePanel(key, _PANEL_WIDTHS.get(key, PANEL_WIDTH),
+                              central)
             self._panels[key] = panel
         self._build_panels()
 
     def _build_panels(self) -> None:
         self._build_batch_panel()
         self._build_project_panel()
+        self._build_experiment_panel()
         self._build_qc_panel()
         self._build_analyze_panel()
         self._build_plots_panel()
         self._build_scripts_panel()
         self._build_ai_panel()
-        self._build_tools_panel()
         for panel in self._panels.values():
             panel.finish()
 
@@ -564,6 +588,29 @@ class HubWindow(QMainWindow):
                      "Experiment Type.")
         self._panels["analyze"].add_card(self._analyze_card)
 
+    def _build_experiment_panel(self) -> None:
+        """The Experiment tile's panel: a grid of the four experiment-level
+        sub-tiles. Each is a full :class:`StatusTile` — same live summaries,
+        same dimming — and clicking one opens the panel it always had,
+        anchored under the Experiment tile."""
+        host = QWidget()
+        row = QHBoxLayout(host)
+        row.setContentsMargins(2, 2, 2, 2)
+        row.setSpacing(6)
+        self._subtiles: dict[str, StatusTile] = {}
+        ## QC first: you decide what to exclude before you analyse it — the
+        ## same order the old ribbon kept. One row of compact, title-only
+        ## chips: the live summaries move to the tooltips, which is what lets
+        ## five of them fit the panel width with room to breathe.
+        for key, title, icon_name, category in SUBTILES:
+            tile = StatusTile(key, title, icon_name, category,
+                              compact=True, max_width=140)
+            tile.set_rounding(6, 6)
+            tile.clicked.connect(self._open_panel_for)
+            self._subtiles[key] = tile
+            row.addWidget(tile, 1)
+        self._panels["experiment"].add_card(host)
+
     def _build_qc_panel(self) -> None:
         card = Card("Quality control", Category.QC, icon_name="qc",
                     subtitle="Exclusion groups are configuration: the active "
@@ -654,20 +701,6 @@ class HubWindow(QMainWindow):
         card.add_body(with_report)
         self._panels["ai"].add_card(card)
 
-    def _build_tools_panel(self) -> None:
-        card = Card("Tools", Category.TOOLS, icon_name="tools")
-        for label, icon_name, handler in (
-            ("Upgrade directory…", "upgrade", self._action_upgrade),
-            ("Wrap in a project…", "project", self._action_wrap_in_project),
-            ("Validate config", "validate", self._action_validate_config),
-            ("Open analysis folder", "open", self._action_open_analysis),
-            ("Clear log", "clear", self._log.clear),
-        ):
-            btn = ActionButton(label, Category.TOOLS, icon_name=icon_name)
-            btn.clicked.connect(handler)
-            card.add_body(btn)
-        self._panels["tools"].add_card(card)
-
     @staticmethod
     def _make_table(headers: list[str]) -> QTableWidget:
         table = QTableWidget(0, len(headers))
@@ -688,7 +721,22 @@ class HubWindow(QMainWindow):
         if self._open_panel == key:
             self.close_panel()
             return
+        if key == "experiment" and self._experiment is None:
+            ## The one tile that is disabled rather than merely dimmed: its
+            ## panel holds nothing but the four sub-tiles, all waiting on the
+            ## same missing thing, so there is no fixer control inside to
+            ## justify opening it. Say where the fix is instead.
+            self._log.append_line(
+                "! Load an experiment first — double-click a member in the "
+                "Project panel, or open a standalone Experiment Directory.")
+            return
         self._open_panel_for(key)
+
+    def _anchor_tile(self, key: str) -> StatusTile:
+        """The ribbon tile a panel anchors under: its own, or — for the four
+        experiment-level panels, whose tiles live inside the Experiment
+        panel — the Experiment tile."""
+        return self._tiles.get(key) or self._tiles["experiment"]
 
     def _open_panel_for(self, key: str) -> None:
         """Open *key*'s panel, whatever is open now.
@@ -699,7 +747,7 @@ class HubWindow(QMainWindow):
         again whenever they were already there.
         """
         self.close_panel()
-        tile = self._tiles[key]
+        tile = self._anchor_tile(key)
         panel = self._panels[key]
         top_left = tile.mapTo(self._central, tile.rect().bottomLeft())
         ## rect().bottom* coordinates are inclusive; +1 starts the panel just
@@ -712,28 +760,47 @@ class HubWindow(QMainWindow):
         if self._open_panel is None:
             return
         self._panels[self._open_panel].hide()
-        self._tiles[self._open_panel].set_active(False)
+        self._anchor_tile(self._open_panel).set_active(False)
         self._open_panel = None
 
-    def _handle_click_away(self, event) -> None:
+    def _handle_click_away(self, receiver, event) -> None:
         """Close the open panel when a press lands outside it.
 
-        Called by :class:`ClickAwayFilter` on GUI-thread mouse presses only.
-        The click itself is never swallowed. Presses on the tile strip are
-        ignored so a tile's own toggle still sees the panel as open (and
-        therefore closes it) rather than re-opening it.
+        Called by :class:`ClickAwayFilter` on GUI-thread mouse presses only,
+        with the object the press is being delivered to. The click itself is
+        never swallowed. Presses on the tile strip are ignored so a tile's own
+        toggle still sees the panel as open (and therefore closes it) rather
+        than re-opening it.
+
+        The hit test is the press's position in **window** coordinates — its
+        local position mapped up from the receiver — rather than
+        ``QApplication.widgetAt`` of its global position. Window coordinates
+        need no screen position (a Wayland window has none, and the global
+        point then resolves to nothing), and they are the same on every
+        delivery of one press: Qt re-delivers an unhandled press to each
+        ancestor in turn, so the receiver alone would name the central widget
+        on a later delivery and close the panel from inside it. A control
+        that opens a different panel from its press handler must *accept*
+        the press (see :meth:`StatusTile.mousePressEvent`) — a late delivery
+        arriving after the swap is judged against the new panel.
         """
         if self._open_panel is None:
             return
         panel = self._panels.get(self._open_panel)
         if panel is None or not panel.isVisible():
             return
-        widget = QApplication.widgetAt(event.globalPosition().toPoint())
+        ## The same press reaches the filter addressed to the native QWindow
+        ## before the widget. Only the widget delivery carries a position
+        ## that maps into this window.
+        if not isinstance(receiver, QWidget):
+            return
         ## A press in another window (a dialog, the QC viewer, the Script
         ## Editor) is not a click away from this panel — closing it there left
         ## the user's place lost behind a dialog they were about to dismiss.
-        if widget is not None and widget.window() is not self:
+        if receiver.window() is not self:
             return
+        point = receiver.mapTo(self, event.position().toPoint())
+        widget = self.childAt(point) or self
         probe = widget
         while probe is not None:
             if probe is panel or probe is self._strip:
@@ -986,49 +1053,59 @@ class HubWindow(QMainWindow):
                 ["nothing selected", "click here ▸ Open project…"])
         else:
             self._tiles["project"].set_summary(
-                ["not a project yet", "Tools ▸ Upgrade or Create project"])
+                ["not a project yet", "Project ▸ Create / Initialize"])
 
         has_exp = self._experiment is not None
-        for key in ("analyze", "qc", "plots", "scripts"):
-            self._tiles[key].set_dimmed(not has_exp)
+        ## The Experiment tile fronts the four sub-tiles, so it carries their
+        ## shared gate: dimmed (and refusing to open) until a member or a
+        ## standalone experiment is loaded.
+        self._tiles["experiment"].set_dimmed(not has_exp)
         if has_exp:
             status = self._experiment.status()
-            self._tiles["analyze"].set_summary(
+            self._tiles["experiment"].set_summary(
+                [f"loaded: {self._experiment.name}",
+                 self._experiment.type.label])
+        else:
+            self._tiles["experiment"].set_summary(
+                ["no experiment loaded", "double-click a member"])
+        for key in ("qc", "analyze", "plots", "scripts"):
+            self._subtiles[key].set_dimmed(not has_exp)
+        if has_exp:
+            self._subtiles["analyze"].set_summary(
                 [self._experiment.type.label,
                  f"{status.n_total or '—'} individuals"
                  if status.analyzed else "not analysed yet"])
-            self._tiles["qc"].set_summary(
+            self._subtiles["qc"].set_summary(
                 [f"group: {self._experiment.exclusion_group or 'none'}",
                  f"{status.n_excluded} chamber(s) excluded"])
-            self._tiles["plots"].set_summary(
+            self._subtiles["plots"].set_summary(
                 [f"{len(self._experiment.type.plot_ids())} figure(s) in the set",
                  f"headline: {self._experiment.type.headline_plot_id or '—'}"])
-            self._tiles["scripts"].set_summary(
+            self._subtiles["scripts"].set_summary(
                 [f"{len(self._experiment.scripts())} experiment script(s)",
                  f"{len(self._project.scripts()) if self._project else 0} "
                  f"project script(s)"])
         else:
-            for key, hint in (("analyze", "load an experiment to analyse"),
-                              ("qc", "load an experiment"),
+            for key, hint in (("qc", "load an experiment"),
+                              ("analyze", "load an experiment to analyse"),
                               ("plots", "load an experiment"),
                               ("scripts", "load one to run scripts")):
-                self._tiles[key].set_summary([hint, ""])
+                self._subtiles[key].set_summary([hint, ""])
 
         ## The AI tile is about the SUBJECT as much as the provider key: with
         ## a key but no Project loaded it used to sit lit next to a dimmed AI
         ## card.
         providers = self._ai_provider.count()
         if not providers:
-            self._tiles["ai"].set_dimmed(True)
-            self._tiles["ai"].set_summary(["no API key", "add one to .env"])
+            self._subtiles["ai"].set_dimmed(True)
+            self._subtiles["ai"].set_summary(["no API key", "add one to .env"])
         else:
             ready = self._project is not None
-            self._tiles["ai"].set_dimmed(not ready)
-            self._tiles["ai"].set_summary(
+            self._subtiles["ai"].set_dimmed(not ready)
+            self._subtiles["ai"].set_summary(
                 [f"{providers} provider(s)",
                  "per-member + across-members" if ready
                  else "select a project first"])
-        self._tiles["tools"].set_summary(["directory tools", ""])
         self._refresh_card_dimming()
         self._refresh_report_button()
 
@@ -1260,12 +1337,21 @@ class HubWindow(QMainWindow):
         from ..script_editor import actions as action_mod
 
         registry = action_mod.registry_for(self._experiment.type)
-        ## The render action stays in the registry — an Experiment Script may
-        ## legitimately render this member's figures — but its BUTTON is
-        ## project-level only: rendering walks every member, so it lives on
-        ## the Project panel and nowhere else.
+        ## Script steps that make no sense as standalone buttons. Rendering
+        ## is project-level (its button lives on the Project panel), and
+        ## apply_exclusions only means something INSIDE a script, where steps
+        ## share a context — a script can run under a different group than
+        ## the config's. As a button it loaded data into a context that was
+        ## thrown away one line later, while every real run already applies
+        ## the active Exclusion Group; the working control is QC's
+        ## "Set active group". The overlay button drew the same figures the
+        ## Chamber QC viewer draws (the same plotting call over the same
+        ## per-chamber lifetables) as dead tabs — the viewer adds flagging
+        ## and Save Exclusions, so it is the one way in.
         registry = {k: a for k, a in registry.items()
-                    if k != "render_publication_figures"}
+                    if k not in ("render_publication_figures",
+                                 "apply_exclusions",
+                                 "chamber_overlay_qc")}
         order = [k for k in action_mod.CORE_KEYS if k in registry]
         order += [k for k in sorted(registry) if k not in order]
         for key in order:
@@ -1586,6 +1672,20 @@ class HubWindow(QMainWindow):
         table until a Batch Run fails on it.
         """
         if self._project is None:
+            ## A standalone experiment has no Project above it (ADR-0003),
+            ## but its one config still deserves the button — this absorbed
+            ## the Tools panel's "Validate config".
+            if self._experiment is not None:
+                problems = self._experiment.validate()
+                if problems:
+                    self._log.append_line(
+                        f"{self._experiment.name} config problems:")
+                    for problem in problems:
+                        self._log.append_line(f"  - {problem}")
+                else:
+                    self._log.append_line(
+                        f"{self._experiment.name}: config is valid.")
+                return
             self._warn("No Project selected.")
             return
         checked = 1 + len(self._project.member_dirs())
@@ -2211,64 +2311,6 @@ class HubWindow(QMainWindow):
             return f"{len(text)} narrative section(s)."
 
         self._spawn("AI narrative", _job)
-
-    def _action_upgrade(self) -> None:
-        if self._selection is None:
-            self._warn("Open a directory first.")
-            return
-        plan = upgrade_mod.plan(self._selection)
-        if plan.is_noop:
-            self._log.append_line("Nothing to upgrade: " + "; ".join(plan.warnings))
-            return
-        message = ("This will:\n  - " + "\n  - ".join(plan.actions)
-                   + ("\n\nNotes:\n  - " + "\n  - ".join(plan.warnings)
-                      if plan.warnings else "")
-                   + "\n\nNothing is deleted or moved.")
-        if QMessageBox.question(self, "Upgrade directory", message) \
-                != QMessageBox.StandardButton.Yes:
-            return
-        upgrade_mod.apply(plan)
-        self._log.append_line(f"Upgraded {plan.directory}.")
-        self._set_selection(plan.directory)
-        self._refresh_all()
-
-    def _action_wrap_in_project(self) -> None:
-        if self._experiment is None:
-            self._warn("Load a standalone experiment first.")
-            return
-        parent = self._experiment.directory.parent
-        if is_project_dir(parent):
-            self._warn(f"{parent} is already a Project.")
-            return
-        project = Project.create(
-            parent,
-            type_key=None if self._experiment.type.is_custom
-            else self._experiment.type.key)
-        self._log.append_line(f"Wrapped {self._experiment.name} in {project.config_path}")
-        self._set_selection(parent)
-        self._refresh_all()
-
-    def _action_validate_config(self) -> None:
-        if self._experiment is None:
-            self._warn("Load an experiment first.")
-            return
-        problems = self._experiment.validate()
-        if problems:
-            self._log.append_line(f"{self._experiment.name} config problems:")
-            for p in problems:
-                self._log.append_line(f"  - {p}")
-        else:
-            self._log.append_line(f"{self._experiment.name}: config is valid.")
-
-    def _action_open_analysis(self) -> None:
-        import subprocess
-
-        target = (self._experiment.analysis_dir if self._experiment
-                  else self._selection)
-        if target is None:
-            return
-        target.mkdir(parents=True, exist_ok=True)
-        subprocess.Popen(["xdg-open", str(target)])
 
     # ── small dialogs ──────────────────────────────────────────────────────
 

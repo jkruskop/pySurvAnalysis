@@ -44,3 +44,27 @@ Project-card button — has no counterpart here: neither action exists, because
 Projects never pool (ADR-0001). The rule it states does hold: this app's
 `project_report` action and the Project card's Project report button already
 run the same thing.
+
+## Amendment (2026-08-30): every `survival_config.yaml` ships `Standard analysis`
+
+The `batch` script's first step is `run_in_experiments: Standard analysis`,
+but no member's file carried a script of that name — it resolved from an
+in-code built-in, so the same invisibility this ADR removed at the Project
+level survived one level down: a user reading a member's config could not see
+what the Batch Run would do there.
+
+`save_config` now applies the Project rule to `survival_config.yaml`: a config
+with no `scripts:` key at all is seeded with an Experiment Script named
+**`Standard analysis`** (one `run_analysis` step, with a `notes:` line saying
+where it came from) on its way to disk; an authored block — an empty list
+included — is never touched. Because every creation path (scaffold, adopt,
+upgrade, the Hub and Preflight repairs) writes through `save_config`, there is
+one rule and no second scaffolding path. The upgrade plan lists the seed as an
+action, so the proposed config the user reviews is the file that is written;
+a legacy `survival_scripts.yaml` import is an authored block and is not
+appended to.
+
+Resolution of a named Experiment Script is unchanged — the Project's central
+`experiment_scripts:`, then the member's own `scripts:`, then the built-ins —
+so a central recipe still serves every member, and a config written before
+this amendment still runs from the built-in until its next write seeds it.

@@ -151,3 +151,91 @@ def test_the_pdf_backend_collapses_consecutive_page_breaks(tmp_path):
     breaks = [i for i, f in enumerate(flow) if isinstance(f, PageBreak)]
     assert all(b + 1 not in breaks for b in breaks), \
         "two PageBreaks in a row would render an empty page"
+
+
+# ── curated Publication Figures in the report ──────────────────────────────
+
+def _figure_blocks(report):
+    return [b for b in report.blocks if isinstance(b, m.Figure)]
+
+
+def test_a_curated_figure_replaces_the_default_in_the_report(project):
+    """As in the sister app: a plot the Plot Editor curated is shown in the
+    report through THAT figure and its style; a plot with nothing curated
+    keeps the analysis's own matplotlib figure."""
+    from pysurvanalysis import pubfigures as pf
+
+    member = project.member("rep_a")
+    result = member.run_analysis()
+
+    ## Nothing curated yet: every figure is the default, at its fixed size.
+    before = _figure_blocks(rb.build_experiment_report(result))
+    assert before
+    assert all(f.width_in == 6.5 and f.height_in == 4.2 for f in before)
+    assert not any("curated" in (f.title or "") for f in before)
+
+    spec = pf.default_spec("km_faceted")
+    spec.facet_by = "Genotype"
+    pf.save_specs(project.directory, {"km_faceted": spec})
+    pf.save_styles(project.directory,
+                   {"default": pf.PlotStyle(name="default", width_mm=127.0,
+                                            height_mm=76.2)})
+
+    after = _figure_blocks(rb.build_experiment_report(result))
+    curated = [f for f in after if "curated" in (f.title or "")]
+    assert len(curated) == 1
+    ## Rendered from the curated Spec + Style — the block carries the style's
+    ## size, not the default's.
+    assert round(curated[0].width_in, 2) == 5.0
+    assert round(curated[0].height_in, 2) == 3.0
+    assert curated[0].data[:8] == b"\x89PNG\r\n\x1a\n"
+    ## The rest are untouched defaults, and the count is the same.
+    assert len(after) == len(before)
+    others = [f for f in after if "curated" not in (f.title or "")]
+    assert all(f.width_in == 6.5 for f in others)
+
+
+def test_a_curated_km_stands_in_for_both_default_km_figures(tmp_path):
+    """The analysis writes two KM figures (with and without the at-risk
+    table); in the publication renderer the table is a Style toggle, so one
+    curated km_curves supersedes both rather than sitting beside a
+    near-duplicate."""
+    from pysurvanalysis import pubfigures as pf
+    from pysurvanalysis.domain import SurvivalExperiment
+    from tests.conftest import make_experiment_dir
+
+    directory = make_experiment_dir(tmp_path / "lone", type_key="standard_lifespan")
+    experiment = SurvivalExperiment(directory)
+    result = experiment.run_analysis()
+    assert {"km_curves", "km_risk_table"} <= set(result.figure_paths)
+
+    before = _figure_blocks(rb.build_experiment_report(result))
+    pf.save_specs(directory, {"km_curves": pf.default_spec("km_curves")})
+    after = _figure_blocks(rb.build_experiment_report(result))
+
+    curated = [f for f in after if "curated" in (f.title or "")]
+    assert len(curated) == 1
+    assert len(after) == len(before) - 1                  # one KM, not two
+    assert not any("at-risk" in (f.title or "").lower() and "curated" not in
+                   (f.title or "") for f in after)
+
+
+def test_a_broken_curation_falls_back_to_the_default(project, monkeypatch):
+    """A curation that cannot render must not sink the report — the default
+    figure stands in, silently, and the report is whole."""
+    from pysurvanalysis import pubfigures as pf
+
+    member = project.member("rep_a")
+    result = member.run_analysis()
+    spec = pf.default_spec("km_faceted")
+    spec.facet_by = "Genotype"
+    pf.save_specs(project.directory, {"km_faceted": spec})
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("cannot render")
+
+    monkeypatch.setattr(pf, "build_ggplot", _boom)
+    figures = _figure_blocks(rb.build_experiment_report(result))
+    assert figures
+    assert not any("curated" in (f.title or "") for f in figures)
+    assert all(f.width_in == 6.5 for f in figures)

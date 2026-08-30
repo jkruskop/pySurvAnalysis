@@ -141,6 +141,17 @@ def plan(directory: str | Path, type_key: str | None = None) -> UpgradePlan:
                 f"import {len(scripts)} script(s) from {LEGACY_SCRIPTS_FILENAME} "
                 f"(the file is left in place)"
             )
+    if "scripts" not in p.proposed_config:
+        ## Shown in the plan rather than left to save_config's seeding, so the
+        ## proposed config the user reviews is the file that gets written.
+        from ..script_editor.project_actions import (
+            DEFAULT_EXPERIMENT_SCRIPT_NAME, default_experiment_script,
+        )
+
+        p.proposed_config["scripts"] = [default_experiment_script()]
+        p.actions.append(
+            f"seed the default {DEFAULT_EXPERIMENT_SCRIPT_NAME!r} Experiment Script"
+        )
 
     legacy_excl = d / LEGACY_EXCLUSIONS_FILENAME
     if legacy_excl.is_file():
