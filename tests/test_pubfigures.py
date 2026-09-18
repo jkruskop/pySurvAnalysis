@@ -78,6 +78,35 @@ def test_faceted_spec_is_seeded_from_the_declared_factors(project):
     assert spec.series_label == "Treatment"
 
 
+def test_treatments_selectable_excludes_forest_and_interaction():
+    """The two kinds whose data functions never consult spec.treatments."""
+    assert pf.treatments_selectable(pf.default_spec("km_curves"))
+    assert pf.treatments_selectable(pf.default_spec("survival_distribution"))
+    assert not pf.treatments_selectable(pf.default_spec("hazard_ratio_forest"))
+    assert not pf.treatments_selectable(pf.default_spec("interaction_lifespan"))
+
+
+def test_available_treatments_lists_every_group_in_the_lifetable(lifetables):
+    spec = pf.default_spec("km_curves")
+    assert pf.available_treatments(None, spec, lifetables) == \
+        sorted(lifetables["treatment"].astype(str).unique())
+
+
+def test_available_treatments_is_empty_when_not_selectable(lifetables):
+    spec = pf.default_spec("hazard_ratio_forest")
+    assert pf.available_treatments(None, spec, lifetables) == []
+
+
+def test_available_treatments_is_the_full_set_series_data_narrows(lifetables):
+    """spec.treatments (what the checklist writes) filters exactly the
+    candidate set available_treatments (what the checklist offers) lists."""
+    spec = pf.default_spec("km_curves")
+    available = pf.available_treatments(None, spec, lifetables)
+    spec.treatments = available[:1]
+    data = pf.series_data(lifetables, spec)
+    assert set(data["treatment"]) == set(available[:1])
+
+
 def test_curve_data_anchors_every_curve_at_one(lifetables):
     spec = pf.default_spec("km_curves")
     data = pf.curve_data(lifetables, spec)

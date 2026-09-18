@@ -501,6 +501,18 @@ def kind_for(spec_or_id) -> PlotKind:
     return PLOT_KINDS.get(str(plot_id), PLOT_KINDS["km_curves"])
 
 
+def treatments_selectable(spec_or_id) -> bool:
+    """Whether ``spec.treatments`` actually narrows this kind's data.
+
+    True for every series-shaped and distribution plot (:func:`series_data`,
+    :func:`distribution_data`); false for the forest, which draws every saved
+    comparison, and the interaction plot, which draws every factorial cell —
+    neither reads the field.
+    """
+    kind = kind_for(spec_or_id)
+    return kind.geom != "interaction" and kind.source != "hazard_ratios"
+
+
 def _derived(grp: pd.DataFrame, kind: PlotKind, smoothing: float = 3.0) -> pd.DataFrame:
     """Add whatever column *kind* wants that the lifetable does not carry."""
     grp = grp.sort_values("time").copy()
@@ -1243,6 +1255,27 @@ def _load_individual_data(experiment) -> pd.DataFrame:
         return pd.read_csv(path)
     data, _ = experiment.load()
     return data
+
+
+def available_treatments(experiment, spec: PlotSpec,
+                         lifetables: pd.DataFrame | None = None) -> list[str]:
+    """Every treatment id this Spec's kind could draw, for a checklist.
+
+    Unlike :func:`series_data`/:func:`distribution_data`, this ignores
+    ``spec.treatments`` — it is the full candidate set that field narrows,
+    not narrowed by it. Empty for a kind :func:`treatments_selectable` says
+    doesn't consult the field at all.
+    """
+    if not treatments_selectable(spec):
+        return []
+    kind = kind_for(spec)
+    if kind.source == "lifetables":
+        df = lifetables if lifetables is not None else _load_lifetables(experiment)
+    else:
+        df = _load_individual_data(experiment)
+    if df is None or not len(df) or "treatment" not in df.columns:
+        return []
+    return sorted(set(df["treatment"].astype(str)))
 
 
 def _load_hazard_ratios(experiment) -> pd.DataFrame:

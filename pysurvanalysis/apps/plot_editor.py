@@ -33,6 +33,8 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -285,6 +287,7 @@ class PlotEditorWindow(QMainWindow):
         side_lay.setContentsMargins(0, 0, 0, 0)
         side_lay.setSpacing(10)
         side_lay.addWidget(self._build_spec_card())
+        side_lay.addWidget(self._build_treatments_card())
         side_lay.addWidget(self._build_canvas_card())
         side_lay.addWidget(self._build_curves_card())
         side_lay.addWidget(self._build_panels_card())
@@ -397,6 +400,33 @@ class PlotEditorWindow(QMainWindow):
         form.addRow("Style:", copy_btn)
 
         card.add_body(form)
+        return card
+
+    def _build_treatments_card(self) -> Card:
+        """Which of the experiment's treatment groups this figure draws.
+
+        Independent of the Style: two figures over the same data may curate
+        a different subset (a headline KM over everything, a forest-adjacent
+        KM over just the pair being compared), so this lives on the Spec,
+        not shared. Unchecking a box narrows :func:`pf.data_for`'s output
+        without touching any saved statistic.
+        """
+        card = Card("Treatments", Category.PLOTS, icon_name="km",
+                    subtitle="Which groups this figure draws. All are shown "
+                             "when every box is checked.")
+        self._treatments_list = QListWidget()
+        self._treatments_list.setSelectionMode(
+            QListWidget.SelectionMode.NoSelection)
+        self._treatments_list.setMaximumHeight(160)
+        self._treatments_list.itemChanged.connect(self._on_treatment_toggled)
+        card.add_body(self._treatments_list)
+
+        row = QHBoxLayout()
+        all_btn = QPushButton("Check all")
+        all_btn.clicked.connect(self._check_all_treatments)
+        row.addWidget(all_btn)
+        row.addStretch(1)
+        card.add_body(row)
         return card
 
     def _build_canvas_card(self) -> Card:
@@ -661,6 +691,83 @@ class PlotEditorWindow(QMainWindow):
         self._rebuild_colour_controls()
         self._refresh_preview()
 
+    # ── treatments ─────────────────────────────────────────────────────────
+
+    def _rebuild_treatments_controls(self) -> None:
+        """Repopulate the checklist from this Spec's data source.
+
+        Rebuilt on every figure switch, not on every preview: the candidate
+        set is the source's full treatment column, which does not change
+        while curating one figure.
+        """
+        spec = self.spec
+        self._treatments_list.blockSignals(True)
+        self._treatments_list.clear()
+        if spec is None or not pf.treatments_selectable(spec):
+            placeholder = QListWidgetItem("Not applicable to this figure.")
+            placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
+            self._treatments_list.addItem(placeholder)
+            self._treatments_list.setEnabled(False)
+            self._treatments_list.blockSignals(False)
+            return
+        available = pf.available_treatments(self.experiment, spec,
+                                            self._lifetables)
+        if not available:
+            placeholder = QListWidgetItem("No data loaded yet.")
+            placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
+            self._treatments_list.addItem(placeholder)
+            self._treatments_list.setEnabled(False)
+            self._treatments_list.blockSignals(False)
+            return
+        ## Empty spec.treatments means "every treatment" (its own docstring),
+        ## so an untouched Spec opens with every box checked, not none.
+        selected = set(spec.treatments) if spec.treatments else set(available)
+        for treatment in available:
+            item = QListWidgetItem(spec.display_names.get(treatment, treatment))
+            item.setData(Qt.ItemDataRole.UserRole, treatment)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if treatment in selected
+                               else Qt.CheckState.Unchecked)
+            self._treatments_list.addItem(item)
+        self._treatments_list.setEnabled(True)
+        self._treatments_list.blockSignals(False)
+
+    def _check_all_treatments(self) -> None:
+        self._treatments_list.blockSignals(True)
+        for i in range(self._treatments_list.count()):
+            item = self._treatments_list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) is not None:
+                item.setCheckState(Qt.CheckState.Checked)
+        self._treatments_list.blockSignals(False)
+        self._refresh_preview()
+
+    def _on_treatment_toggled(self, item: QListWidgetItem) -> None:
+        """Refresh on every toggle — except the one that would leave none
+        checked: an empty checklist is indistinguishable from
+        ``spec.treatments == []``, which means "every treatment", so it
+        would show the opposite of what emptying the list asked for. The box
+        that would cause that stays checked instead.
+        """
+        if item.data(Qt.ItemDataRole.UserRole) is None:
+            return
+        if item.checkState() == Qt.CheckState.Unchecked \
+                and not self._any_treatment_checked():
+            self._treatments_list.blockSignals(True)
+            item.setCheckState(Qt.CheckState.Checked)
+            self._treatments_list.blockSignals(False)
+            self._say("At least one treatment must stay checked.")
+            return
+        self._refresh_preview()
+
+    def _any_treatment_checked(self) -> bool:
+        for i in range(self._treatments_list.count()):
+            item = self._treatments_list.item(i)
+            if (item.data(Qt.ItemDataRole.UserRole) is not None
+                    and item.checkState() == Qt.CheckState.Checked):
+                return True
+        return False
+        self._refresh_preview()
+
     # ── state <-> form ─────────────────────────────────────────────────────
 
     @property
@@ -711,6 +818,7 @@ class PlotEditorWindow(QMainWindow):
         self._reference_line.setEnabled(spec.reference_line is not None)
         for widget in (self._ref_check, self._reference_line):
             widget.blockSignals(False)
+        self._rebuild_treatments_controls()
         self._load_style_into_form()
 
     #: form attribute -> style field, for the three kinds of control that
@@ -811,6 +919,21 @@ class PlotEditorWindow(QMainWindow):
             spec.y_limits = (sorted((self._ylim_lo.value(),
                                      self._ylim_hi.value()))
                              if self._ylim_check.isChecked() else [])
+            if pf.treatments_selectable(spec):
+                ids, checked = [], []
+                for i in range(self._treatments_list.count()):
+                    item = self._treatments_list.item(i)
+                    treatment = item.data(Qt.ItemDataRole.UserRole)
+                    if treatment is None:
+                        continue        # the placeholder row
+                    ids.append(treatment)
+                    if item.checkState() == Qt.CheckState.Checked:
+                        checked.append(treatment)
+                ## Only once the list has real rows — an empty checklist
+                ## means the data hasn't loaded yet, not that the user
+                ## unchecked every treatment there is.
+                if ids:
+                    spec.treatments = [] if checked == ids else checked
             spec.style = spec.plot_id      # each figure owns its style
         for attr, field_name in self._NUMBERS:
             setattr(style, field_name, getattr(self, attr).value())
